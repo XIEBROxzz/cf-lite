@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.12"
+export SCRIPT_VERSION="2.13"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -1776,9 +1776,9 @@ _service_menu() {
         local c=""
         read -r -p "  请选择 [0-5]: " c || return 0
         case "$c" in
-            1) _manage_service start ;;
+            1) _manage_service start; _ensure_services_ready ;;
             2) _manage_service stop ;;
-            3) _manage_service restart ;;
+            3) _manage_service restart; _ensure_services_ready ;;
             4) _argo_action restart ;;
             5) _show_status ;;
             0) return 0 ;;
@@ -2031,6 +2031,18 @@ _ensure_argo_running() {
     fi
     _error "Argo 隧道拉起失败，执行 xg diag / xg argo-log 查看原因。"
     return 1
+}
+
+
+# 启动/重启之后的统一收尾：拉起崩掉的 Argo + 补开保活。
+# 命令行的 xg restart、菜单 [4] 服务控制、xg rebuild 都走这里，
+# 避免以后再出现「某个入口忘了开保活」。
+_ensure_services_ready() {
+    _ensure_argo_running
+    if _argo_deployed && ! _watchdog_enabled; then
+        _enable_argo_watchdog || _warn "保活未启用，可手动: xg keepalive-on 30"
+    fi
+    return 0
 }
 
 
@@ -2459,9 +2471,9 @@ _show_status() {
         if _watchdog_enabled; then
             echo -e "  自动保活 : ${GREEN}已开启${NC}（每 $(_keepalive_interval) 秒巡检，崩溃自动拉起）" >&2
         elif [ -x "$KEEPALIVE_SCRIPT" ]; then
-            echo -e "  自动保活 : ${YELLOW}脚本在但 cron 未挂${NC}（${CYAN}xg keepalive-on${NC}）" >&2
+            echo -e "  自动保活 : ${YELLOW}脚本在但 cron 未挂${NC}（${CYAN}xg keepalive-on 30${NC}）" >&2
         else
-            echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on${NC} 开启）" >&2
+            echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on 30${NC} 开启）" >&2
         fi
     else
         echo -e "  隧道     : ${YELLOW}尚未部署${NC}" >&2
@@ -2529,6 +2541,10 @@ _rebuild_config() {
     else
         _info "服务当前未运行，配置已更新，下次启动生效。"
     fi
+
+    # 保活是独立于配置的（crontab + /etc/xray/argo-keepalive.sh），重建不会丢；
+    # 没开的话顺手补上，省得用户以为必须重新部署
+    _ensure_services_ready
     return 0
 }
 
@@ -2689,13 +2705,7 @@ main() {
         start | stop | restart)
             _install_dependencies >/dev/null 2>&1
             _manage_service "$cmd"
-            if [ "$cmd" != "stop" ]; then
-                _ensure_argo_running
-                # 保活没开就顺手补上：更新脚本不会重新部署，光靠 deploy 分支开不起来
-                if _argo_deployed && ! _watchdog_enabled; then
-                    _enable_argo_watchdog || _warn "保活未启用，稍后可手动: xg keepalive-on 30"
-                fi
-            fi
+            [ "$cmd" != "stop" ] && _ensure_services_ready
             ;;
         log)
             _view_log
