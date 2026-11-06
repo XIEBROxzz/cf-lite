@@ -38,7 +38,7 @@ CF_ACCOUNT_ID=""
 ARGO_TOKEN="${ARGO_TOKEN:-}"
 ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_PORT="${ARGO_PORT:-8001}"
-ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
+ARGO_PROTOCOL="${ARGO_PROTOCOL:-quic}"
 ARGO_TUNNEL_ID="${ARGO_TUNNEL_ID:-}"
 ARGO_ZONE_ID="${ARGO_ZONE_ID:-}"
 DEP_STATE_VERSION="20261106-2"
@@ -1098,7 +1098,7 @@ _argo_auto_setup() {
     ARGO_TOKEN=""
     ARGO_DOMAIN=""
     ARGO_PORT="8001"
-    ARGO_PROTOCOL="http2"
+    ARGO_PROTOCOL="quic"
     ARGO_TUNNEL_ID=""
     ARGO_ZONE_ID=""
 
@@ -1116,10 +1116,11 @@ _argo_auto_setup() {
     read -r -p "  Argo 本地端口（回车 8001，需与 ingress 一致）: " port || port=""
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || port="8001"
 
-    read -r -p "  隧道协议 [http2/quic]（回车 http2）: " proto || proto=""
+    read -r -p "  隧道协议 [1.quic 2.http2]（回车 quic）: " proto || proto=""
     case "${proto,,}" in
-        quic) proto="quic" ;;
-        *) proto="http2" ;;
+        1 | quic | q)          proto="quic" ;;
+        2 | http2 | h2 | tcp)  proto="http2" ;;
+        *)                     proto="quic" ;;
     esac
 
     _info "正在查询 ${domain} 所属 Zone..."
@@ -2011,7 +2012,7 @@ Xray-go · Argo 隧道版 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     [7] 诊断   [8] 重建配置   [9] 更新核心   [10] 更新脚本   [11] 卸载
 
 环境变量（部署时可选，免去交互）:
-  ARGO_DOMAIN / ARGO_PROTOCOL(http2|quic) / ARGO_PORT
+  ARGO_DOMAIN / ARGO_PROTOCOL(1=quic 2=http2) / ARGO_PORT
   CF_EMAIL / CF_API_KEY
 EOF
 }
