@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Debian-11%2B-A81D33?style=flat-square&logo=debian&logoColor=white" alt="Debian">
   <img src="https://img.shields.io/badge/CentOS-7%2F8%2F9-26252D?style=flat-square&logo=centos&logoColor=white" alt="CentOS">
   <img src="https://img.shields.io/badge/Alpine-Linux-0D5BE1?style=flat-square&logo=alpine&logoColor=white" alt="Alpine">
-  <img src="https://img.shields.io/badge/Xray--go-V1.3-2ea44f?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Xray--go-V1.4-2ea44f?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License">
 </p>
 
@@ -83,7 +83,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 
 ```
   ╔══════════════════════════════════════════╗
-  ║     Xray-go 一键部署管理脚本 V1.3        ║
+  ║     Xray-go 一键部署管理脚本 V1.4        ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -304,6 +304,28 @@ tcpdump -ni any udp port 7844                        # 抓到包就是真 UDP
 
 ---
 
+## 🧹 日志刷 X-Forwarded-For 警告怎么办
+
+```
+[Warning] common/protocol/http: received "X-Forwarded-For" from 127.0.0.1:52878
+but "sockopt.trustedXForwardedFor" is not configured; ignoring it and using the real remote address
+```
+
+**这是无害的**。Argo 的流量是 cloudflared 从 `127.0.0.1` 转进来的，每个 HTTP 请求都带一个 `X-Forwarded-For` 头；Xray 默认不信任任何来源的 XFF，于是忽略它、改用真实地址（`127.0.0.1`），并且**每个请求打一条 Warning**——所以一秒能刷十几条。
+
+- 不影响连通性、不影响速度，只是日志刷屏、`/var/log/xray.log` 长得快
+- 新版已给 Argo inbound 加上 `sockopt.trustedXForwardedFor: ["127.0.0.1/32", "::1/128"]`（该 inbound 只监听回环，信任本机是安全的）
+- **老部署不用重装**，重建一次配置就消掉，端口 / 密钥 / 链接都不变：
+
+```bash
+xg update-script     # 先拿到 V1.4+
+xg rebuild           # 由 meta.json 重建 config.json 并重启
+```
+
+`xg diag` 会显示日志里这类警告的条数。如果 `xg rebuild` 之后还在刷，说明核心版本太老、不认识这个字段，用菜单 `[10]` 升级核心即可。
+
+---
+
 ### 兼容旧版参数写法
 
 原有的复合参数仍然可用（`port"xxxx"` 的解析已修复）：
@@ -340,6 +362,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 | **[10] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
 | **[11] 更新脚本** | 从仓库拉取最新管理脚本，更新后显示 `V旧 -> V新` |
 | **[12] 卸载部署** | 与 `uninstall.sh` 等价：停服务 + 删云端隧道 + 删 DNS 解析 + 删本地全部文件 + 删 `xg`，一次确认走完 |
+| **[13] 重建配置** | 由 `meta.json` 重新生成 `config.json` 并重启，**端口 / 密钥 / 链接全不变**。改了配置模板（如本次的 sockopt）不必重新部署 |
 
 命令行等价用法：
 
@@ -347,34 +370,34 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 xg 1..5                       # 命令行数字快捷指令（1 菜单 / 2 部署两者 / 3 链接 / 4 状态 / 5 卸载）
 xg reality | h3 | argo        # 只部署单个协议
 xg del-node | del-argo        # 删除节点（前者可选协议，后者直删 Argo）
-xg deploy | custom | links | status | start | stop | restart | log | check | diag | update-core | update-script | uninstall
+xg deploy | custom | links | status | start | stop | restart | log | rebuild | check | diag | update-core | update-script | uninstall
 ```
 
-> 命令行数字（`xg 1`~`xg 5`）与菜单内编号（`[1]`~`[12]`）不是同一套，别混用。
+> 命令行数字（`xg 1`~`xg 5`）与菜单内编号（`[1]`~`[13]`）不是同一套，别混用。
 
 ---
 
 ## 🏷️ 版本与更新
 
-当前版本：**V1.3**（构建 2026-11-06）
+当前版本：**V1.4**（构建 2026-11-06）
 
 想确认自己装的是哪一版、更新有没有成功，看这三处任一处即可：
 
 ```bash
-xg -v                 # 输出: Xray-go V1.3 (2026-11-06)
-xg status             # 状态页会显示「脚本版本 : V1.3 (2026-11-06)」
-xg                    # 菜单标题栏直接显示 V1.3
+xg -v                 # 输出: Xray-go V1.4 (2026-11-06)
+xg status             # 状态页会显示「脚本版本 : V1.4 (2026-11-06)」
+xg                    # 菜单标题栏直接显示 V1.4
 ```
 
 更新脚本时的反馈规则：
 
 | 情况 | 输出 |
 | :--- | :--- |
-| 远端版本更新 | `[成功] 脚本已更新: V1.2 -> V1.3` |
-| 远端版本相同 | `[成功] 当前已是最新版本 V1.3，无需更新。` |
-| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.3（版本号未变化）` |
+| 远端版本更新 | `[成功] 脚本已更新: V1.3 -> V1.4` |
+| 远端版本相同 | `[成功] 当前已是最新版本 V1.4，无需更新。` |
+| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.4（版本号未变化）` |
 
-版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.3"`，改这里即可发新版。
+版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.4"`，改这里即可发新版。
 
 ---
 

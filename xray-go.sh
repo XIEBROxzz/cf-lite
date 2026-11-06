@@ -14,7 +14,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="1.3"
+export SCRIPT_VERSION="1.4"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -619,7 +619,10 @@ _build_config_from_meta() {
                 streamSettings: {
                     network: "xhttp",
                     security: "none",
-                    xhttpSettings: {path: ("/" + ($m.argo_path // "argo")), mode: "auto"}
+                    xhttpSettings: {path: ("/" + ($m.argo_path // "argo")), mode: "auto"},
+                    # cloudflared 会带 X-Forwarded-For；不声明信任来源时核心每次请求都刷一条 Warning
+                    # 这个 inbound 只监听 127.0.0.1，信任本机回环是安全的
+                    sockopt: {trustedXForwardedFor: ["127.0.0.1/32", "::1/128"]}
                 },
                 sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false}
             } else empty end)
@@ -795,6 +798,14 @@ _diag() {
             fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
             *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（服务未运行或日志为空）" >&2 ;;
         esac
+
+        # cloudflared 每个请求都带 X-Forwarded-For；核心没声明信任来源就刷 Warning（无害但很吵）
+        local xff=0
+        [ -s "$LOG_FILE" ] && xff=$(grep -c 'trustedXForwardedFor' "$LOG_FILE" 2>/dev/null)
+        xff=${xff:-0}
+        if [ "$xff" -gt 0 ] 2>/dev/null; then
+            echo -e "  XFF 警告 : ${xff} 条（不影响使用，仅刷日志）" >&2
+        fi
     fi
 
     echo "" >&2
@@ -886,6 +897,10 @@ _diag() {
                 echo -e "  ${GREEN}Argo 隧道走 QUIC（UDP 7844）${NC}：客户端用 H3-Argo 链接即为全段 UDP。" >&2
                 ;;
         esac
+        if [ "${xff:-0}" -gt 0 ] 2>/dev/null; then
+            echo -e "  ${CYAN}X-Forwarded-For 警告${NC}：Argo 每个请求都会带该头，核心未声明信任来源时会刷日志。" >&2
+            echo -e "     无害，不影响连通性。消除办法：${CYAN}xg rebuild${NC}（新版模板已给 Argo inbound 加 sockopt.trustedXForwardedFor）。" >&2
+        fi
     fi
 
     [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
@@ -2599,6 +2614,57 @@ _show_status() {
     echo "" >&2
 }
 
+# 由 meta.json 重建 config.json 并重启：端口 / 密钥 / 节点链接都不变
+# 用于「改了脚本里的配置模板」这类修复（例如 Argo inbound 的 sockopt），不必重新部署
+_rebuild_config() {
+    _check_root
+    _detect_init_system
+
+    if [ ! -s "$META_FILE" ]; then
+        _error "尚未部署，没有可重建的配置。"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        _error "缺少 jq，无法由 meta.json 重建配置。"
+        return 1
+    fi
+
+    _info "正在由 meta.json 重建 config.json..."
+    local bak=""
+    if [ -s "$CONFIG_FILE" ]; then
+        bak="${CONFIG_FILE}.bak.$$"
+        cp -f "$CONFIG_FILE" "$bak" 2>/dev/null || bak=""
+    fi
+
+    if ! _write_config; then
+        [ -n "$bak" ] && mv -f "$bak" "$CONFIG_FILE"
+        _error "重建失败，已保留原配置。"
+        return 1
+    fi
+    if ! _check_config; then
+        if [ -n "$bak" ]; then
+            mv -f "$bak" "$CONFIG_FILE"
+            _warn "新配置未通过校验，已恢复原配置。"
+        else
+            _error "新配置未通过校验。"
+        fi
+        return 1
+    fi
+    [ -n "$bak" ] && rm -f "$bak"
+
+    if _service_is_running; then
+        _info "正在重启 Xray 服务..."
+        if ! _manage_service restart; then
+            _error "重启失败，请查看日志: ${LOG_FILE}"
+            return 1
+        fi
+        _success "配置已重建并重启，端口与节点链接保持不变。"
+    else
+        _info "服务当前未运行，配置已更新，下次启动生效。"
+    fi
+    return 0
+}
+
 _service_menu() {
     while true; do
         echo "" >&2
@@ -2907,14 +2973,15 @@ _main_menu() {
         echo -e "  ${CYAN}【维护】${NC}" >&2
         echo -e "    ${GREEN}[10]${NC} 更新 Xray 核心" >&2
         echo -e "    ${GREEN}[11]${NC} 更新脚本" >&2
-        echo -e "    ${RED}[12]${NC} 卸载部署 (云端隧道 + DNS + 本地文件)" >&2
+        echo -e "    ${GREEN}[12]${NC} 卸载部署 (云端隧道 + DNS + 本地文件)" >&2
+        echo -e "    ${GREEN}[13]${NC} 重建配置 (由 meta 重新生成并重启，端口/链接不变)" >&2
         echo "" >&2
         echo -e "  ───────────────────────────────────────────" >&2
         echo -e "    ${YELLOW}[0]${NC} 退出" >&2
         echo "" >&2
 
         local choice=""
-        read -r -p "  请输入选项 [0-12]: " choice || return 0
+        read -r -p "  请输入选项 [0-13]: " choice || return 0
         case "$choice" in
             1) _deploy_single_proto reality ;;
             2) _deploy_single_proto h3 ;;
@@ -2929,6 +2996,7 @@ _main_menu() {
             11) _update_script && exit 0 ;;
             12) _uninstall_deploy
                 [ "${XG_UNINSTALLED:-0}" = "1" ] && exit 0 ;;
+            13) _rebuild_config ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -2971,6 +3039,7 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     status            查看运行状态
     start|stop|restart 控制 Xray 服务
     log               查看实时日志
+    rebuild           由 meta.json 重建配置并重启（端口/链接不变，改配置后免重装）
     check             校验配置文件
     diag              连通性自检（端口监听 / Argo 传输 UDP 还是 TCP / 防火墙 / 证书 / 日志 / 结论）
     update-core       更新 Xray 核心
@@ -3078,6 +3147,10 @@ main() {
         check)
             _install_dependencies >/dev/null 2>&1
             _check_config
+            ;;
+        rebuild | rebuild-config)
+            _install_dependencies >/dev/null 2>&1
+            _rebuild_config
             ;;
         diag | diagnose)
             _install_dependencies >/dev/null 2>&1
