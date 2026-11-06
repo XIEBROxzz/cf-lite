@@ -121,6 +121,7 @@ echo -e "    - Xray 服务 / Argo 隧道服务（systemd、openrc 或 direct 进
 echo -e "    - 配置目录: ${XRAY_DIR}（配置、证书、密钥、cloudflared）" >&2
 echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
 echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
+[ -f /usr/local/bin/xg ] && echo -e "    - 管理命令: /usr/local/bin/xg" >&2
 echo "" >&2
 
 SKIP_CONFIRM=false
@@ -169,21 +170,15 @@ _info "正在删除配置与日志..."
 rm -rf "$XRAY_DIR" "$RUNTIME_DIR"
 rm -f "$LOG_FILE" "$ARGO_LOG_FILE"
 
+# 6. 管理命令一并删除（确认时已列在清单里，不再二次询问）
+if [ -f "/usr/local/bin/xg" ]; then
+    rm -f /usr/local/bin/xg 2>/dev/null \
+        && _success "管理命令已删除: /usr/local/bin/xg" \
+        || _warn "删除失败，请手动执行 rm -f /usr/local/bin/xg"
+fi
+
 echo "" >&2
 _success "Xray-go 已卸载完成。"
-
-if [ -x "/usr/local/bin/xg" ]; then
-    if [ "$SKIP_CONFIRM" = "true" ]; then
-        _info "管理命令仍保留：/usr/local/bin/xg（删除: rm -f /usr/local/bin/xg）"
-    else
-        read -r -p "  是否同时删除管理命令 /usr/local/bin/xg? (y/N): " del_xg || del_xg=""
-        if [[ "${del_xg,,}" =~ ^(y|yes)$ ]]; then
-            rm -f /usr/local/bin/xg 2>/dev/null \
-                && _success "管理命令已删除: /usr/local/bin/xg" \
-                || _warn "删除失败，请手动执行 rm -f /usr/local/bin/xg"
-        else
-            _info "已保留管理命令：/usr/local/bin/xg"
-        fi
-    fi
-fi
+echo -e "  ${CYAN}当前终端里的进程还在内存中，退出后 xg 命令即不可用。${NC}" >&2
+echo -e "  如需重新部署: ${CYAN}bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)${NC}" >&2
 echo "" >&2

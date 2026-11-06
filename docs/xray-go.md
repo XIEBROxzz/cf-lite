@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Debian-11%2B-A81D33?style=flat-square&logo=debian&logoColor=white" alt="Debian">
   <img src="https://img.shields.io/badge/CentOS-7%2F8%2F9-26252D?style=flat-square&logo=centos&logoColor=white" alt="CentOS">
   <img src="https://img.shields.io/badge/Alpine-Linux-0D5BE1?style=flat-square&logo=alpine&logoColor=white" alt="Alpine">
-  <img src="https://img.shields.io/badge/Xray--go-V1.1-2ea44f?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Xray--go-V1.2-2ea44f?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License">
 </p>
 
@@ -83,7 +83,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 
 ```
   ╔══════════════════════════════════════════╗
-  ║     Xray-go 一键部署管理脚本 V1.1        ║
+  ║     Xray-go 一键部署管理脚本 V1.2        ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -136,8 +136,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 
 | 选项 | 作用 |
 | :--- | :--- |
-| `[1]` | 只部署 / 重部署 **Reality Vision**，会问端口 |
-| `[2]` | 只部署 / 重部署 **H3 直连**，会问端口 |
+| `[1]` | 只部署 / 重部署 **Reality Vision**，会问端口 + SNI（伪装目标） |
+| `[2]` | 只部署 / 重部署 **H3 直连**，会问端口 + SNI + 可选自备证书 |
 | `[3]` | **Argo 自动搭建**（可单独使用，也可叠加在已有节点上） |
 
 命令行等价写法：
@@ -172,9 +172,19 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 
 状态页会显示成 `Reality=443→31000`，一眼能看出映射关系。
 
-### H3 的 SNI 与证书（可自定义）
+### SNI 与证书（Reality / H3 都能手填）
 
-H3 走 TLS（QUIC），必须有一张证书。部署 H3 时脚本会多问两行：
+**Reality** 部署时多问一行（伪装目标域名，需是支持 TLS1.3 + H2 的真实站点）：
+
+```
+  Reality SNI (伪装目标) [回车 www.apple.com]:
+```
+
+- 直接回车 = 沿用上次部署记录，没有记录才用默认 `www.apple.com`
+- 填了带 `http://`、路径或端口的非法值会提示并回退，不会把节点写坏
+- 想换默认值：`REALITY_SNI=www.amd.com xg reality`（或部署前 `export REALITY_SNI=...`）
+
+**H3** 走 TLS（QUIC），必须有一张证书。部署 H3 时脚本会多问两行：
 
 ```
   H3 SNI [回车 bing.com]:
@@ -275,7 +285,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 | **[9] 诊断** | `xray -test` 校验配置 + 连通性自检（TCP/UDP 监听、防火墙、证书、日志、结论） |
 | **[10] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
 | **[11] 更新脚本** | 从仓库拉取最新管理脚本，更新后显示 `V旧 -> V新` |
-| **[12] 卸载部署** | 与 `uninstall.sh` 等价：停服务 + 删云端隧道 + 删 DNS 解析 + 删本地全部文件 + 询问是否一并删 `xg` |
+| **[12] 卸载部署** | 与 `uninstall.sh` 等价：停服务 + 删云端隧道 + 删 DNS 解析 + 删本地全部文件 + 删 `xg`，一次确认走完 |
 
 命令行等价用法：
 
@@ -292,25 +302,25 @@ xg deploy | custom | links | status | start | stop | restart | log | check | dia
 
 ## 🏷️ 版本与更新
 
-当前版本：**V1.1**（构建 2026-11-06）
+当前版本：**V1.2**（构建 2026-11-06）
 
 想确认自己装的是哪一版、更新有没有成功，看这三处任一处即可：
 
 ```bash
-xg -v                 # 输出: Xray-go V1.1 (2026-11-06)
-xg status             # 状态页会显示「脚本版本 : V1.1 (2026-11-06)」
-xg                    # 菜单标题栏直接显示 V1.1
+xg -v                 # 输出: Xray-go V1.2 (2026-11-06)
+xg status             # 状态页会显示「脚本版本 : V1.2 (2026-11-06)」
+xg                    # 菜单标题栏直接显示 V1.2
 ```
 
 更新脚本时的反馈规则：
 
 | 情况 | 输出 |
 | :--- | :--- |
-| 远端版本更新 | `[成功] 脚本已更新: V1.0 -> V1.1` |
-| 远端版本相同 | `[成功] 当前已是最新版本 V1.1，无需更新。` |
-| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.1（版本号未变化）` |
+| 远端版本更新 | `[成功] 脚本已更新: V1.1 -> V1.2` |
+| 远端版本相同 | `[成功] 当前已是最新版本 V1.2，无需更新。` |
+| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.2（版本号未变化）` |
 
-版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.1"`，改这里即可发新版。
+版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.2"`，改这里即可发新版。
 
 ---
 
@@ -347,15 +357,19 @@ xg          # 进菜单后选 [12] 卸载部署
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)
 ```
 
-菜单 `[12]` 与 `uninstall.sh` 的清理范围完全一致，都会做下面这些事：
+菜单 `[12]` 与 `uninstall.sh` 的清理范围完全一致，**只确认一次就一路走完**：
 
 1. 停止并移除 Xray / Argo 服务（systemd unit、openrc 服务、direct 进程按 pidfile 精确 kill）
 2. **删除 Cloudflare 云端隧道**（`cascade=true`）**与对应的 DNS 解析记录**
 3. 无条件清理 systemd / openrc 的 unit 文件（不依赖当前运行模式判定，容器等混合环境也不会留残留）
 4. 删除 `/etc/xray`（配置、证书、密钥、cloudflared、`cf.json`、`argo.env`）、`/run/xraygo` 与 `/var/log/xray*.log`
-5. 最后询问是否一并删除管理命令 `/usr/local/bin/xg`（默认保留）
+5. 删除管理命令 `/usr/local/bin/xg`
 
-**会保留的**：系统依赖（`curl` / `jq` / `openssl` / `unzip`）、`/usr/local/bin/xg`（第 4 步选 `y` 才删）。
+确认前会先把**完整清单**列出来（含 `xg` 的路径），输入 `y` 后不再二次询问；卸载完成后脚本直接退出，不回主菜单。
+
+**会保留的**：系统依赖（`curl` / `jq` / `openssl` / `unzip`）。
+
+> 卸载后当前终端里如果还敲得动 `xg`，是因为**那个 bash 进程已经在内存里跑着**，磁盘上的 `/usr/local/bin/xg` 确实已删除。`Ctrl+D` 或关掉终端再试就没了（`ls /usr/local/bin/xg` 可验证）。
 
 **唯一需要手动收尾**：Argo 是手动填 Token 部署的（`meta.json` 里没有 `tunnel_id`），脚本无从得知隧道归属，卸载时会提示你去 Cloudflare 控制台手动删隧道与 DNS。
 

@@ -14,7 +14,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="1.1"
+export SCRIPT_VERSION="1.2"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -50,13 +50,17 @@ ARGO_LOG_FILE="/var/log/xray-argo.log"
 RUNTIME_DIR="/run/xraygo"
 PID_FILE="${RUNTIME_DIR}/xray.pid"
 ARGO_PID_FILE="${RUNTIME_DIR}/cloudflared.pid"
-DEFAULT_REALITY_SNI="www.apple.com"
+# Reality 伪装目标域名：需是支持 TLS1.3 + H2 的真实站点
+DEFAULT_REALITY_SNI="${REALITY_SNI:-www.apple.com}"
 # 自签证书默认域名；可用环境变量 H3_SNI 覆盖（自动化部署时省掉交互）
 H3_SNI="${H3_SNI:-bing.com}"
-# 本次部署的 H3 覆盖值（由 [2] 部署 H3 / 自定义部署询问后设置，空则用默认）
+# 本次部署的覆盖值（由部署入口询问后设置，空则沿用 meta / 默认值）
+DEPLOY_REALITY_SNI="${DEPLOY_REALITY_SNI:-}"
 DEPLOY_H3_SNI="${DEPLOY_H3_SNI:-}"
 DEPLOY_H3_CERT="${DEPLOY_H3_CERT:-}"
 DEPLOY_H3_KEY="${DEPLOY_H3_KEY:-}"
+# 管理命令安装路径（可用 SELF_BIN 覆盖，便于测试/自定义安装位置）
+SELF_BIN="${SELF_BIN:-/usr/local/bin/xg}"
 CF_ADDR_H2="www.visa.com.hk"
 CF_ADDR_H3="www.teamviewer.com"
 CF_PORT="443"
@@ -1661,6 +1665,14 @@ _deploy_all() {
         h3_sni=$(jq -r '.h3_sni // ""' "$META_FILE" 2>/dev/null)
     fi
     [ -n "$h3_sni" ] || h3_sni="$H3_SNI"
+
+    # Reality 伪装目标：本次指定 > 已有部署记录 > 默认值（只重部署 H3 时不会改动它）
+    local reality_sni="${DEPLOY_REALITY_SNI:-}"
+    if [ -z "$reality_sni" ] && [ -s "$META_FILE" ]; then
+        reality_sni=$(jq -r '.reality_sni // ""' "$META_FILE" 2>/dev/null)
+    fi
+    [ -n "$reality_sni" ] || reality_sni="$DEFAULT_REALITY_SNI"
+
     local server_ip
     server_ip=$(_server_ip)
 
@@ -1715,7 +1727,7 @@ _deploy_all() {
         --arg uuid "$uuid" \
         --argjson reality_port "$reality_port" \
         --argjson reality_public_port "$reality_public" \
-        --arg reality_sni "$DEFAULT_REALITY_SNI" \
+        --arg reality_sni "$reality_sni" \
         --arg reality_private_key "$private_key" \
         --arg reality_public_key "$public_key" \
         --arg reality_short_id "$short_id" \
@@ -1796,6 +1808,9 @@ _deploy_all() {
     if [ "$reality_port" = "0" ]; then reality_show="未启用"; else reality_show=$(_port_desc "$reality_port" "$reality_public"); fi
     if [ "$h3_port" = "0" ]; then h3_show="未启用"; else h3_show=$(_port_desc "$h3_port" "$h3_public"); fi
     echo -e "  Reality 端口 : ${reality_show}" >&2
+    if [ "$reality_port" != "0" ]; then
+        echo -e "  Reality SNI  : ${reality_sni}  (伪装目标)" >&2
+    fi
     echo -e "  H3 端口      : ${h3_show}" >&2
     if [ "$h3_port" != "0" ]; then
         local cert_show="自签"
@@ -1837,6 +1852,7 @@ _one_click_deploy() {
             spec=$(_parse_port_spec "")
         fi
         reality_port="${spec%% *}"; reality_public="${spec##* }"
+        _ask_reality_sni
 
         input=""
         read -r -p "  H3 端口      [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
@@ -1926,6 +1942,7 @@ _custom_deploy() {
         fi
         reality_port="${spec%% *}"; reality_public="${spec##* }"
         _info "Reality 端口: $(_port_desc "$reality_port" "$reality_public")"
+        _ask_reality_sni
     fi
 
     input=""
@@ -2163,6 +2180,34 @@ _argo_delete_node() {
     return 0
 }
 
+# SNI 基本校验：必须是纯域名（不带协议/路径/端口），否则 Reality 会握手失败
+_sni_valid() {
+    local s="${1:-}"
+    [ -n "$s" ] || return 1
+    case "$s" in */*|*:*|*" "*) return 1 ;; esac
+    case "$s" in *.*) return 0 ;; *) return 1 ;; esac
+}
+
+# 询问 Reality 的伪装目标域名（SNI），结果写入 DEPLOY_REALITY_SNI
+_ask_reality_sni() {
+    local input="" cur=""
+    if [ -s "$META_FILE" ]; then
+        cur=$(jq -r '.reality_sni // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
+    fi
+    [ -n "$cur" ] || cur="$DEFAULT_REALITY_SNI"
+
+    read -r -p "  Reality SNI (伪装目标) [回车 ${cur}]: " input || input=""
+    input=$(printf '%s' "$input" | tr -d '[:space:]')
+    [ -n "$input" ] || { DEPLOY_REALITY_SNI="$cur"; return 0; }
+
+    if ! _sni_valid "$input"; then
+        _warn "SNI 应是不带 http:// 和路径的域名（如 www.apple.com），已改用 ${cur}。"
+        DEPLOY_REALITY_SNI="$cur"
+        return 0
+    fi
+    DEPLOY_REALITY_SNI="$input"
+}
+
 # 询问 H3 的 SNI 与可选自定义证书，结果写入 DEPLOY_H3_SNI / DEPLOY_H3_CERT / DEPLOY_H3_KEY
 _ask_h3_tls() {
     local input="" keyin="" sni_given=0 cn=""
@@ -2246,9 +2291,11 @@ _deploy_single_proto() {
     fi
     listen="${spec%% *}"; pub="${spec##* }"
 
-    # H3 需要证书与 SNI：允许自定义，Reality 不走这一套
+    # H3 需要证书与 SNI；Reality 只需要伪装目标域名
     if [ "$kind" = "h3" ]; then
         _ask_h3_tls
+    else
+        _ask_reality_sni
     fi
 
     if [ "$kind" = "reality" ]; then
@@ -2448,8 +2495,10 @@ _show_status() {
             (if (.argo_port // 0) > 0 and (.argo_token // "") != "" then "Argo=\(.argo_port)" else empty end)
         ] | join("  ")' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
-        local h3s
+        local rs h3s
+        rs=$(jq -r 'if (.reality_port // 0) > 0 then (.reality_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
         h3s=$(jq -r 'if (.h3_port // 0) > 0 then (.h3_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
+        [ -n "$rs" ] && echo -e "  Reality SNI: ${rs}" >&2
         [ -n "$h3s" ] && echo -e "  H3 SNI   : ${h3s}" >&2
     else
         echo -e "  端口     : ${YELLOW}尚未部署${NC}" >&2
@@ -2523,6 +2572,8 @@ _uninstall_deploy() {
     echo -e "    - 配置目录: ${XRAY_DIR}（含配置、证书、密钥、cloudflared、CF 凭据）" >&2
     echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
     echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
+    local self_cmd="$SELF_BIN"
+    [ -f "$self_cmd" ] && echo -e "    - 管理命令: ${self_cmd}" >&2
     if [ -n "$cloud_tid" ]; then
         echo -e "    - ${YELLOW}Cloudflare 云端隧道 ${cloud_tid}${NC}" >&2
         [ -n "$cloud_domain" ] && echo -e "    - ${YELLOW}DNS 解析记录 ${cloud_domain}${NC}" >&2
@@ -2531,7 +2582,7 @@ _uninstall_deploy() {
     fi
     echo "" >&2
 
-    if ! _ask_yes "  确认卸载 Xray-go? (y/N): " n; then
+    if ! _ask_yes "  确认卸载以上全部内容? (y/N): " n; then
         _info "已取消卸载。"
         return 0
     fi
@@ -2571,19 +2622,18 @@ _uninstall_deploy() {
     rm -rf "$XRAY_DIR" "$RUNTIME_DIR"
     rm -f "$LOG_FILE" "$ARGO_LOG_FILE"
 
-    _success "Xray-go 已卸载完成。"
-
-    # 管理命令 xg 默认保留，按需一并删除，避免"卸完还留个 xg"的疑惑
-    local self_cmd="/usr/local/bin/xg"
+    # 管理命令一并删除：确认时已列在清单里，不再二次询问
     if [ -f "$self_cmd" ]; then
-        if _ask_yes "  是否同时删除管理命令 ${self_cmd}? (y/N): " n; then
-            rm -f "$self_cmd" 2>/dev/null \
-                && _success "管理命令已删除: ${self_cmd}" \
-                || _warn "删除 ${self_cmd} 失败，请手动执行 rm -f ${self_cmd}"
-        else
-            _info "已保留管理命令: ${self_cmd}（可继续用它重新部署）"
-        fi
+        rm -f "$self_cmd" 2>/dev/null \
+            && _success "管理命令已删除: ${self_cmd}" \
+            || _warn "删除 ${self_cmd} 失败，请手动执行 rm -f ${self_cmd}"
     fi
+
+    _success "Xray-go 已卸载完成。"
+    echo -e "  ${CYAN}当前终端里的 xg 进程还在内存中，退出后 xg 命令即不可用。${NC}" >&2
+    echo -e "  如需重新部署: ${CYAN}bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)${NC}" >&2
+    # 标记已卸载，调用方据此直接退出，不再回主菜单
+    XG_UNINSTALLED=1
     return 0
 }
 
@@ -2784,7 +2834,8 @@ _main_menu() {
             9) _check_config; echo "" >&2; _diag ;;
             10) _update_core ;;
             11) _update_script && exit 0 ;;
-            12) _uninstall_deploy ;;
+            12) _uninstall_deploy
+                [ "${XG_UNINSTALLED:-0}" = "1" ] && exit 0 ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -2840,7 +2891,8 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
 环境变量（一键部署时可选）:
   ARGO_TOKEN / ARGO_DOMAIN / ARGO_PROTOCOL / ARGO_PORT
   CF_EMAIL / CF_API_KEY   （提供后 Argo 走自动搭建，无需手动建隧道）
-  H3_SNI                  （自签证书域名，默认 bing.com）
+  REALITY_SNI             （Reality 伪装目标，默认 www.apple.com）
+  H3_SNI                  （H3 自签证书域名，默认 bing.com）
 EOF
 }
 
@@ -2881,6 +2933,7 @@ main() {
             ;;
         5)
             _uninstall_deploy
+            exit 0
             ;;
         0 | q | quit | exit)
             exit 0
@@ -2945,6 +2998,7 @@ main() {
             ;;
         uninstall)
             _uninstall_deploy
+            exit 0
             ;;
         menu)
             _install_dependencies || _warn "依赖安装未完全成功，部分功能可能不可用。"
