@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.8"
+export SCRIPT_VERSION="2.9"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -946,7 +946,36 @@ EOF
             systemctl enable xray-argo >/dev/null 2>&1 || true
             ;;
         openrc)
-            cat > "$ARGO_SERVICE_FILE" <<EOF
+            # 有 supervise-daemon 就用它托管：进程崩溃（OOM / 被 kill / cloudflared
+            # 自己 --retries 耗尽退出）后自动拉起。没有则退回 command_background，
+            # 那种模式下崩了就是彻底没了，只能人工重启。
+            if command -v supervise-daemon >/dev/null 2>&1; then
+                cat > "$ARGO_SERVICE_FILE" <<EOF
+#!/sbin/openrc-run
+description="Xray Argo Tunnel (Xray-go)"
+supervisor="supervise-daemon"
+command="${CLOUDFLARED_BIN}"
+command_args="tunnel --no-autoupdate --retries 5 --grace-period 1s --protocol ${proto} --ha-connections ${conns} run"
+respawn_delay=5
+respawn_max=0
+pidfile="${ARGO_PID_FILE}"
+output_log="${ARGO_LOG_FILE}"
+error_log="${ARGO_LOG_FILE}"
+
+start_pre() {
+    checkpath -d -m 0700 ${RUNTIME_DIR}
+    set -a
+    . ${ARGO_ENV_FILE}
+    set +a
+}
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+            else
+                cat > "$ARGO_SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
 description="Xray Argo Tunnel (Xray-go)"
 command="${CLOUDFLARED_BIN}"
@@ -968,6 +997,7 @@ depend() {
     after firewall
 }
 EOF
+            fi
             chmod 755 "$ARGO_SERVICE_FILE" 2>/dev/null || true
             rc-update add xray-argo default >/dev/null 2>&1 || true
             ;;
@@ -1740,6 +1770,25 @@ _argo_is_running() {
 }
 
 
+# 已部署 Argo 但进程没在跑时，顺手拉起来。
+# 典型场景：跑大流量时 cloudflared 被 OOM kill / --retries 耗尽退出，
+# openrc 老模板没有 supervise-daemon，崩了就再也不会自己起来。
+_ensure_argo_running() {
+    [ -s "$META_FILE" ] || return 0
+    local token
+    token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
+    [ -n "$token" ] || return 0
+    _argo_is_running && return 0
+    _warn "Argo 隧道当前未运行，正在拉起..."
+    if _argo_action restart; then
+        _success "Argo 隧道已恢复。"
+        return 0
+    fi
+    _error "Argo 隧道拉起失败，执行 xg argo-log 查看原因。"
+    return 1
+}
+
+
 # 连通性自检：环境 / 隧道 / Argo 传输 / 日志 / 结论
 _diag() {
     _check_root
@@ -1883,7 +1932,23 @@ _diag() {
     if ! _argo_is_running; then
         issues=$((issues + 1))
         _error "cloudflared 未运行，Cloudflare 边缘无法把流量送到本机。"
-        echo -e "     处理：菜单 [4] 服务控制 → 重启 Argo 隧道，或看 ${ARGO_LOG_FILE}。" >&2
+        echo -e "     处理：${CYAN}xg restart${NC}（会顺带拉起 Argo），或 ${CYAN}xg argo-log${NC} 看退出原因。" >&2
+
+        # 大流量下崩溃最常见的原因是 OOM，先看一眼内核有没有留证据
+        local oom=""
+        oom=$(dmesg 2>/dev/null | grep -iE 'oom-kill|killed process.*cloudflared' | tail -n1)
+        [ -n "$oom" ] || oom=$(grep -ihE 'oom-kill|killed process.*cloudflared' \
+            /var/log/messages /var/log/syslog 2>/dev/null | tail -n1)
+        if [ -n "$oom" ]; then
+            echo -e "     ${YELLOW}疑似内存不足被内核 kill${NC}：$(printf '%s' "$oom" | cut -c1-120)" >&2
+            echo -e "     加 swap 或换更大内存的机器；自动重启仍会被反复杀。" >&2
+        fi
+
+        # openrc 老模板用 command_background，崩了不会自己起来
+        if [ "$INIT_SYSTEM" = "openrc" ] && [ -f "$ARGO_SERVICE_FILE" ] \
+           && ! grep -q 'supervise-daemon' "$ARGO_SERVICE_FILE" 2>/dev/null; then
+            echo -e "     ${YELLOW}当前 Argo 服务脚本是旧模板${NC}（无自动重启）：${CYAN}xg argo restart${NC} 会重写为守护模式。" >&2
+        fi
     fi
 
     case "$at_state" in
@@ -2103,6 +2168,7 @@ _show_status() {
             echo -e "  Argo     : ${GREEN}● 运行中${NC}" >&2
         else
             echo -e "  Argo     : ${YELLOW}○ 已安装 (未运行)${NC}" >&2
+            echo -e "             ${CYAN}xg restart${NC} 自动拉起，或 ${CYAN}xg diag${NC} 查原因" >&2
         fi
     else
         echo -e "  Argo     : ${RED}○ 未安装${NC}" >&2
@@ -2351,6 +2417,9 @@ main() {
         start | stop | restart)
             _install_dependencies >/dev/null 2>&1
             _manage_service "$cmd"
+            if [ "$cmd" != "stop" ]; then
+                _ensure_argo_running
+            fi
             ;;
         log)
             _view_log
