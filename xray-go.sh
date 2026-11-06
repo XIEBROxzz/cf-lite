@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.5"
+export SCRIPT_VERSION="2.6"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -615,13 +615,27 @@ _argo_transport() {
     [ -n "$log_proto" ] || log_proto=$(printf '%s' "$batch" \
         | grep -oiE 'transport[=: ]+(quic|http2)|using (quic|http2)' | tail -n1 \
         | grep -oiE 'quic|http2')
-    printf '%s' "$batch" | grep -qiE 'falling back|fallback|failed to dial to edge with quic|quic.*fail' && fallback=true
+    # 真正的回退证据只有两种：明确说 failed to dial / falling back，
+    # 或者「配置要 quic，但注册结果里一条 quic 都没有」。
+    # 不能用 'quic.*fail' 这种宽泛正则 —— precheck 里那行
+    # "region2 ... FAIL  QUIC connection failed" 是探针结果，不是隧道回退，
+    # 4 条连接全注册成 quic 时照样会命中，属于误报。
+    printf '%s' "$batch" | grep -qiE 'falling back|failed to dial to edge with quic' && fallback=true
+
+    # cloudflared 启动时的 UDP 连通性自检（两个区域端点各探一次）
+    local pre1="-" pre2="-"
+    pre1=$(printf '%s\n' "$batch" | grep -oE 'region1[^|]*(PASS|FAIL)' | grep -oE 'PASS|FAIL' | tail -n1)
+    pre2=$(printf '%s\n' "$batch" | grep -oE 'region2[^|]*(PASS|FAIL)' | grep -oE 'PASS|FAIL' | tail -n1)
+    pre1=${pre1:--}; pre2=${pre2:--}
 
     if [ "$fallback" = true ]; then
         state="fallback"
     elif [ "$mix_q" -gt 0 ] 2>/dev/null && [ "$mix_h" -gt 0 ] 2>/dev/null; then
         # 同一批里既有 quic 又有 http2：UDP 7844 只通了一部分，个别连接回退了
         state="mixed"
+    elif [ "$mix_h" -gt 0 ] 2>/dev/null && [ "$mix_q" -eq 0 ] 2>/dev/null && [ "$cfg" = "quic" ]; then
+        # 要的是 quic，实际一条都没建成 → 真回退
+        state="fallback"
     elif [ "$udp" -gt 0 ] 2>/dev/null; then
         state="quic"
     elif [ "$tcp" -gt 0 ] 2>/dev/null; then
@@ -630,8 +644,8 @@ _argo_transport() {
         state="$log_proto"
     fi
 
-    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
-        "$state" "${cfg:-$proc_proto}" "$udp" "$tcp" "$log_proto" "${mix_q}:${mix_h}:${mix_n}"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
+        "$state" "${cfg:-$proc_proto}" "$udp" "$tcp" "$log_proto" "${mix_q}:${mix_h}:${mix_n}" "${pre1}/${pre2}"
 }
 
 _write_systemd_service() {
@@ -1761,8 +1775,8 @@ _diag() {
     echo -e "  隧道协议 : ${aproto:-未记录}" >&2
     echo -e "  本地监听 : 127.0.0.1:${ap}   TCP:$(_listen_check "${ap}" t)" >&2
 
-    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" at_mix="" xff=0 xff_cfg=0
-    IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log at_mix < <(_argo_transport)
+    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" at_mix="" at_pre="" xff=0 xff_cfg=0
+    IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log at_mix at_pre < <(_argo_transport)
     echo "" >&2
     echo -e "${CYAN}════════ Argo 传输（UDP / QUIC）════════${NC}" >&2
     echo -e "  配置协议 : ${at_cfg:-未记录}   （cloudflared --protocol）" >&2
@@ -1783,6 +1797,10 @@ _diag() {
         fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
         *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（连接计数与隧道日志都没取到）" >&2 ;;
     esac
+    # cloudflared 启动时的 UDP 连通性自检结果（region1/region2 各探一次）
+    if [ -n "${at_pre:-}" ] && [ "${at_pre}" != "-/-" ]; then
+        echo -e "  UDP 自检 : region1 ${at_pre%%/*} / region2 ${at_pre##*/}   （cloudflared precheck）" >&2
+    fi
     if [ "${at_udp:-0}" = "0" ] && [ "${at_tcp:-0}" = "0" ] && _argo_is_running; then
         echo -e "     ${CYAN}cloudflared 在跑但数不到连接${NC}：本机没有 ss/netstat，内核表也读不到。" >&2
         echo -e "     不影响使用，可看 ${CYAN}xg argo-log${NC} 里的 protocol=xxx。" >&2
@@ -1855,6 +1873,12 @@ _diag() {
             ;;
         quic)
             echo -e "  ${GREEN}Argo 隧道走 QUIC（UDP 7844）${NC}：客户端用 H3-Argo 链接即为全段 UDP。" >&2
+            # 自检里有个区域探针失败但连接都注册上了：说明 UDP 是「部分可用」，
+            # 现在能跑，但网络抖动时可能出现个别连接重建
+            if [ -n "${at_pre:-}" ] && [ "${at_pre##*/}" = "FAIL" ]; then
+                echo -e "     ${YELLOW}注意${NC}：UDP 自检 region2 失败，UDP 7844 属「部分可用」。" >&2
+                echo -e "     当前连接都注册成功，可正常使用；若以后频繁掉线，改用 http2 更稳。" >&2
+            fi
             ;;
     esac
 
@@ -1867,6 +1891,12 @@ _diag() {
             echo -e "     影响：日志里的客户端 IP 全是 127.0.0.1，连通性不受影响。" >&2
             echo -e "     消除办法：${CYAN}xg rebuild${NC}（会用新版模板给 Argo inbound 加 sockopt.trustedXForwardedFor）。" >&2
         fi
+    fi
+
+    # quic-go 的接收缓冲区告警：rmem_max 太小会限制 QUIC 单连接吞吐
+    if _collect_argo_logtext | grep -qi 'increase receive buffer size'; then
+        echo -e "  ${CYAN}UDP 缓冲区偏小${NC}：quic-go 提示 rmem_max 不足，会限制 QUIC 吞吐（不影响连通性）。" >&2
+        echo -e "     能改就 ${CYAN}sysctl -w net.core.rmem_max=7500000${NC}；容器里通常无权限，改不了可忽略。" >&2
     fi
 
     [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
