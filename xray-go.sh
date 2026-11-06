@@ -14,7 +14,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="1.0"
+export SCRIPT_VERSION="1.1"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -51,7 +51,12 @@ RUNTIME_DIR="/run/xraygo"
 PID_FILE="${RUNTIME_DIR}/xray.pid"
 ARGO_PID_FILE="${RUNTIME_DIR}/cloudflared.pid"
 DEFAULT_REALITY_SNI="www.apple.com"
-H3_SNI="bing.com"
+# 自签证书默认域名；可用环境变量 H3_SNI 覆盖（自动化部署时省掉交互）
+H3_SNI="${H3_SNI:-bing.com}"
+# 本次部署的 H3 覆盖值（由 [2] 部署 H3 / 自定义部署询问后设置，空则用默认）
+DEPLOY_H3_SNI="${DEPLOY_H3_SNI:-}"
+DEPLOY_H3_CERT="${DEPLOY_H3_CERT:-}"
+DEPLOY_H3_KEY="${DEPLOY_H3_KEY:-}"
 CF_ADDR_H2="www.visa.com.hk"
 CF_ADDR_H3="www.teamviewer.com"
 CF_PORT="443"
@@ -514,15 +519,25 @@ _install_cloudflared() {
 # ==============================================================================
 
 _gen_certificate() {
-    _info "正在生成 H3 自签证书..."
+    local sni="${1:-$H3_SNI}" san_ip="${2:-}"
+    _info "正在生成 H3 自签证书 (SNI: ${sni})..."
     if ! openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE" 2>/dev/null; then
         _error "生成私钥失败（缺少 openssl）。"
         return 1
     fi
+
+    local san="DNS:${sni}"
+    [ -n "$san_ip" ] && san="${san},IP:${san_ip}"
+
+    # 现代 TLS 只认 SAN，优先带上；openssl < 1.1.1 不支持 -addext 时退回仅 CN
     if ! openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" \
-        -subj "/CN=${H3_SNI}" 2>/dev/null; then
-        _error "生成自签证书失败。"
-        return 1
+        -subj "/CN=${sni}" -addext "subjectAltName=${san}" 2>/dev/null; then
+        if ! openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" \
+            -subj "/CN=${sni}" 2>/dev/null; then
+            _error "生成自签证书失败。"
+            return 1
+        fi
+        _warn "当前 openssl 不支持 -addext，证书未含 SAN，客户端需允许不安全证书。"
     fi
     chmod 600 "$KEY_FILE" "$CERT_FILE" 2>/dev/null || true
     return 0
@@ -686,15 +701,16 @@ _diag() {
         return 1
     fi
 
-    local rp rpub hp hpub ap adom
-    IFS=$'\x1f' read -r rp rpub hp hpub ap adom < <(
+    local rp rpub hp hpub ap adom hs
+    IFS=$'\x1f' read -r rp rpub hp hpub ap adom hs < <(
         jq -r '[((.reality_port // 0) | tostring),
                 ((.reality_public_port // .reality_port // 0) | tostring),
                 ((.h3_port // 0) | tostring),
                 ((.h3_public_port // .h3_port // 0) | tostring),
                 ((.argo_port // 0) | tostring),
-                (.argo_domain // "")]
-               | join("\u001f")' "$META_FILE" 2>/dev/null
+                (.argo_domain // ""),
+                (.h3_sni // "")]
+               | join("\u001f")' "$META_FILE" 2>/dev/null | tr -d '\r'
     )
 
     echo "" >&2
@@ -745,6 +761,7 @@ _diag() {
         local san
         san=$(openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName 2>/dev/null | tail -n1)
         echo -e "  SAN: ${san:-无（客户端需 allowInsecure）}" >&2
+        echo -e "  配置 SNI: ${hs:-（未记录）}" >&2
     fi
 
     echo "" >&2
@@ -777,6 +794,14 @@ _diag() {
     fi
     if [ "${hp:-0}" != "0" ] && [ "$h_udp" = "是" ] && _service_is_running; then
         echo -e "  ${GREEN}服务端 H3 监听正常${NC}：若客户端仍不通，重点查云安全组 UDP、运营商 UDP 封锁、客户端核心版本。" >&2
+    fi
+    # SNI 与证书域名不一致时，客户端会直接拒绝握手（表现为"连上了但没网"）
+    if [ "${hp:-0}" != "0" ] && [ -n "${hs:-}" ] && [ -s "$CERT_FILE" ]; then
+        if ! openssl x509 -in "$CERT_FILE" -noout -subject -ext subjectAltName 2>/dev/null | grep -qF "$hs"; then
+            issues=$((issues + 1))
+            _warn "配置的 SNI (${hs}) 不在证书域名里 —— 客户端会校验失败。" >&2
+            echo -e "     处理：菜单 [2] 重部署 H3 时把 SNI 改成证书上的域名，或改用自签证书（链接带 allowInsecure=1）。" >&2
+        fi
     fi
     [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
 
@@ -1506,17 +1531,18 @@ _isp_tag() {
 _show_links() {
     [ -s "$META_FILE" ] || { _error "尚未部署，请先执行一键部署。"; return 1; }
 
-    local uuid reality_port reality_sni reality_pub reality_sid h3_port h3_path \
-          argo_port argo_path argo_domain argo_protocol saved_ip
+    local uuid reality_port reality_sni reality_pub reality_sid h3_port h3_sni h3_path \
+          argo_port argo_path argo_domain argo_protocol saved_ip h3_selfsigned
     # 用 \x1f(US) 分隔：制表符属于空白字符，连续出现会被 read 合并，导致空字段错位
-    IFS=$'\x1f' read -r uuid reality_port reality_sni reality_pub reality_sid h3_port h3_path \
-        argo_port argo_path argo_domain argo_protocol saved_ip < <(
+    IFS=$'\x1f' read -r uuid reality_port reality_sni reality_pub reality_sid h3_port h3_sni h3_path \
+        argo_port argo_path argo_domain argo_protocol saved_ip h3_selfsigned < <(
         jq -r '[.uuid // "",
                 ((.reality_public_port // .reality_port // 0) | tostring), (.reality_sni // ""), (.reality_public_key // ""), (.reality_short_id // ""),
-                ((.h3_public_port // .h3_port // 0) | tostring), (.h3_path // ""),
+                ((.h3_public_port // .h3_port // 0) | tostring), (.h3_sni // ""), (.h3_path // ""),
                 ((.argo_port // 0) | tostring), (.argo_path // ""), (.argo_domain // ""), (.argo_protocol // ""),
-                (.server_ip // "")]
-               | join("\u001f")' "$META_FILE" 2>/dev/null
+                (.server_ip // ""),
+                (if .h3_selfsigned == null then "true" else (.h3_selfsigned | tostring) end)]
+               | join("\u001f")' "$META_FILE" 2>/dev/null | tr -d '\r'
     )
 
     if [ -z "$uuid" ]; then
@@ -1539,7 +1565,10 @@ _show_links() {
         lines+=("vless://${uuid}@${host}:${reality_port}?encryption=none&security=reality&sni=${reality_sni}&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=tcp&flow=xtls-rprx-vision#${isp}%20Reality%20Vision%20ESS")
     fi
     if [ "${h3_port:-0}" != "0" ] && [ -n "$h3_port" ]; then
-        lines+=("vless://${uuid}@${host}:${h3_port}?encryption=none&security=tls&sni=${H3_SNI}&alpn=h3&fp=chrome&type=xhttp&mode=auto&path=/${h3_path}&allowInsecure=1#${isp}%20H3-XHTTP%20ESS")
+        # 自签证书必须允许不安全校验；自备域名证书则按正常校验走
+        local h3_insecure=""
+        [ "${h3_selfsigned:-true}" = "true" ] && h3_insecure="&allowInsecure=1"
+        lines+=("vless://${uuid}@${host}:${h3_port}?encryption=none&security=tls&sni=${h3_sni:-$H3_SNI}&alpn=h3&fp=chrome&type=xhttp&mode=auto&path=/${h3_path}${h3_insecure}#${isp}%20H3-XHTTP%20ESS")
     fi
     if [ -n "$argo_domain" ] && [ "${argo_port:-0}" != "0" ] && [ -n "$argo_port" ]; then
         lines+=("vless://${uuid}@${CF_ADDR_H2}:${CF_PORT}?encryption=none&security=tls&alpn=h2&sni=${argo_domain}&fp=chrome&type=xhttp&mode=auto&host=${argo_domain}&path=/${argo_path}#${isp}%20H2-Argo%20XHTTP%20ESS")
@@ -1626,7 +1655,40 @@ _deploy_all() {
     [ -s "$META_FILE" ] && uuid=$(jq -r '.uuid // ""' "$META_FILE" 2>/dev/null)
     [ -n "$uuid" ] || uuid=$(_gen_uuid)
 
-    _gen_certificate || return 1
+    # SNI 优先级：本次指定 > 已有部署记录 > 默认值（避免只重部署 Reality 时把 H3 的 SNI 重置）
+    local h3_sni="${DEPLOY_H3_SNI:-}"
+    if [ -z "$h3_sni" ] && [ -s "$META_FILE" ]; then
+        h3_sni=$(jq -r '.h3_sni // ""' "$META_FILE" 2>/dev/null)
+    fi
+    [ -n "$h3_sni" ] || h3_sni="$H3_SNI"
+    local server_ip
+    server_ip=$(_server_ip)
+
+    # 证书来源：自定义证书 > 自签；未部署 H3 时沿用 meta 记录，避免把自签/自备状态改错
+    local h3_selfsigned=true
+    if [ -s "$META_FILE" ]; then
+        h3_selfsigned=$(jq -r 'if .h3_selfsigned == null then true else .h3_selfsigned end' "$META_FILE" 2>/dev/null)
+        [ -n "$h3_selfsigned" ] || h3_selfsigned=true
+    fi
+
+    if [ -n "${DEPLOY_H3_CERT:-}" ] && [ -n "${DEPLOY_H3_KEY:-}" ] \
+        && [ -f "$DEPLOY_H3_CERT" ] && [ -f "$DEPLOY_H3_KEY" ]; then
+        _info "正在使用自定义证书: ${DEPLOY_H3_CERT}"
+        cp -f "$DEPLOY_H3_CERT" "$CERT_FILE" 2>/dev/null || { _error "复制证书失败: ${DEPLOY_H3_CERT}"; return 1; }
+        cp -f "$DEPLOY_H3_KEY" "$KEY_FILE" 2>/dev/null || { _error "复制私钥失败: ${DEPLOY_H3_KEY}"; return 1; }
+        chmod 600 "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
+        h3_selfsigned=false
+    elif [ -n "${DEPLOY_H3_CERT:-}" ]; then
+        _warn "自定义证书文件已不存在，改用自签证书。"
+    fi
+
+    if [ "$h3_selfsigned" = "true" ]; then
+        if [ "$h3_port" != "0" ] || [ ! -s "$CERT_FILE" ] || [ ! -s "$KEY_FILE" ]; then
+            _gen_certificate "$h3_sni" "$server_ip" || return 1
+        else
+            _info "沿用现有 H3 证书（本次不部署 H3）。"
+        fi
+    fi
 
     local keypair private_key="" public_key="" short_id=""
     # 已有 Reality 密钥则沿用，避免只重部署 H3 时把 Reality 的 pbk/sid 换掉导致客户端失效
@@ -1645,8 +1707,6 @@ _deploy_all() {
 
     local h3_path="${uuid}-xu"
     local argo_path="${uuid}-argo"
-    local server_ip
-    server_ip=$(_server_ip)
 
     _info "正在写入部署元数据..."
     local meta_tmp
@@ -1661,6 +1721,8 @@ _deploy_all() {
         --arg reality_short_id "$short_id" \
         --argjson h3_port "$h3_port" \
         --argjson h3_public_port "$h3_public" \
+        --arg h3_sni "$h3_sni" \
+        --argjson h3_selfsigned "$h3_selfsigned" \
         --arg h3_path "$h3_path" \
         --argjson argo_port "$argo_port" \
         --arg argo_path "$argo_path" \
@@ -1681,6 +1743,8 @@ _deploy_all() {
             reality_short_id: $reality_short_id,
             h3_port: $h3_port,
             h3_public_port: $h3_public_port,
+            h3_sni: $h3_sni,
+            h3_selfsigned: $h3_selfsigned,
             h3_path: $h3_path,
             argo_port: $argo_port,
             argo_path: $argo_path,
@@ -1733,6 +1797,11 @@ _deploy_all() {
     if [ "$h3_port" = "0" ]; then h3_show="未启用"; else h3_show=$(_port_desc "$h3_port" "$h3_public"); fi
     echo -e "  Reality 端口 : ${reality_show}" >&2
     echo -e "  H3 端口      : ${h3_show}" >&2
+    if [ "$h3_port" != "0" ]; then
+        local cert_show="自签"
+        [ "$h3_selfsigned" = "false" ] && cert_show="自备"
+        echo -e "  H3 SNI       : ${h3_sni}  (${cert_show}证书)" >&2
+    fi
     echo -e "  Argo 端口    : ${argo_port}  (${argo_protocol})" >&2
     echo -e "  服务模式     : ${INIT_SYSTEM}" >&2
 
@@ -1776,6 +1845,7 @@ _one_click_deploy() {
             spec=$(_parse_port_spec "")
         fi
         h3_port="${spec%% *}"; h3_public="${spec##* }"
+        _ask_h3_tls
     else
         spec=$(_parse_port_spec "")
         reality_port="${spec%% *}"; reality_public="${spec##* }"
@@ -1867,6 +1937,7 @@ _custom_deploy() {
         fi
         h3_port="${spec%% *}"; h3_public="${spec##* }"
         _info "H3 端口: $(_port_desc "$h3_port" "$h3_public")"
+        _ask_h3_tls
     fi
 
     local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
@@ -2092,6 +2163,46 @@ _argo_delete_node() {
     return 0
 }
 
+# 询问 H3 的 SNI 与可选自定义证书，结果写入 DEPLOY_H3_SNI / DEPLOY_H3_CERT / DEPLOY_H3_KEY
+_ask_h3_tls() {
+    local input="" keyin="" sni_given=0 cn=""
+    # 每次询问都从干净状态开始，避免上一次的证书残留影响本次部署
+    DEPLOY_H3_CERT=""
+    DEPLOY_H3_KEY=""
+
+    read -r -p "  H3 SNI [回车 ${H3_SNI}]: " input || input=""
+    input=$(printf '%s' "$input" | tr -d '[:space:]')
+    [ -n "$input" ] && sni_given=1
+    DEPLOY_H3_SNI="${input:-$H3_SNI}"
+
+    input=""
+    read -r -p "  证书 crt 路径 [回车自签]: " input || input=""
+    input=$(printf '%s' "$input" | tr -d '[:space:]')
+    [ -n "$input" ] || return 0
+    if [ ! -f "$input" ]; then
+        _warn "证书文件不存在，已改回自签证书。"
+        return 0
+    fi
+    read -r -p "  私钥 key 路径: " keyin || keyin=""
+    keyin=$(printf '%s' "$keyin" | tr -d '[:space:]')
+    if [ -f "$keyin" ]; then
+        DEPLOY_H3_CERT="$input"
+        DEPLOY_H3_KEY="$keyin"
+        _info "将使用自定义证书: ${DEPLOY_H3_CERT}"
+        # 证书域名与 SNI 不一致时客户端会校验证书失败；用户没手填 SNI 就按证书 CN 自动对齐
+        if [ "$sni_given" -eq 0 ]; then
+            cn=$(openssl x509 -in "$DEPLOY_H3_CERT" -noout -subject 2>/dev/null \
+                | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | tr -d '[:space:]')
+            if [ -n "$cn" ] && [ "$cn" != "$DEPLOY_H3_SNI" ]; then
+                DEPLOY_H3_SNI="$cn"
+                _info "已按证书 CN 自动设置 SNI: ${cn}"
+            fi
+        fi
+    else
+        _warn "私钥文件不存在，已改回自签证书。"
+    fi
+}
+
 # 单独部署 / 重部署直连协议（reality | h3），保留其它已部署协议不受影响
 _deploy_single_proto() {
     local kind="$1"
@@ -2134,6 +2245,11 @@ _deploy_single_proto() {
         spec=$(_parse_port_spec "")
     fi
     listen="${spec%% *}"; pub="${spec##* }"
+
+    # H3 需要证书与 SNI：允许自定义，Reality 不走这一套
+    if [ "$kind" = "h3" ]; then
+        _ask_h3_tls
+    fi
 
     if [ "$kind" = "reality" ]; then
         reality_port="$listen"; reality_public="$pub"
@@ -2332,6 +2448,9 @@ _show_status() {
             (if (.argo_port // 0) > 0 and (.argo_token // "") != "" then "Argo=\(.argo_port)" else empty end)
         ] | join("  ")' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
+        local h3s
+        h3s=$(jq -r 'if (.h3_port // 0) > 0 then (.h3_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
+        [ -n "$h3s" ] && echo -e "  H3 SNI   : ${h3s}" >&2
     else
         echo -e "  端口     : ${YELLOW}尚未部署${NC}" >&2
     fi
@@ -2721,6 +2840,7 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
 环境变量（一键部署时可选）:
   ARGO_TOKEN / ARGO_DOMAIN / ARGO_PROTOCOL / ARGO_PORT
   CF_EMAIL / CF_API_KEY   （提供后 Argo 走自动搭建，无需手动建隧道）
+  H3_SNI                  （自签证书域名，默认 bing.com）
 EOF
 }
 

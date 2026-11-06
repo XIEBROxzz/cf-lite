@@ -14,6 +14,7 @@
   <img src="https://img.shields.io/badge/Debian-11%2B-A81D33?style=flat-square&logo=debian&logoColor=white" alt="Debian">
   <img src="https://img.shields.io/badge/CentOS-7%2F8%2F9-26252D?style=flat-square&logo=centos&logoColor=white" alt="CentOS">
   <img src="https://img.shields.io/badge/Alpine-Linux-0D5BE1?style=flat-square&logo=alpine&logoColor=white" alt="Alpine">
+  <img src="https://img.shields.io/badge/Xray--go-V1.1-2ea44f?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License">
 </p>
 
@@ -72,28 +73,32 @@ apk update && apk add curl bash
 
 ### 方式一：一键安装（推荐）
 
-安装管理命令 `xg`，安装完会显示数字菜单，输入数字直接执行：
+安装管理命令 `xg`，**装完直接进入管理菜单**：
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
 ```
 
-安装后：
+安装完成后看到的就是主菜单：
 
 ```
-1) 进入管理菜单（推荐）
-2) 一键部署 Reality + H3
-3) 查看节点链接
-4) 查看运行状态
-5) 卸载部署
-0) 退出
+  ╔══════════════════════════════════════════╗
+  ║     Xray-go 一键部署管理脚本 V1.1        ║
+  ╚══════════════════════════════════════════╝
 ```
 
-也可以直接带数字：
+也可以在安装时直接带参数跳过菜单：
+
+```bash
+bash install.sh 2        # 装完直接一键部署 Reality + H3
+bash install.sh custom   # 装完直接进自定义部署
+```
+
+日常使用命令行快捷指令：
 
 ```bash
 xg 1   # 管理菜单
-xg 2   # 一键部署（Reality + H3 随机端口）
+xg 2   # 一键部署（Reality + H3，端口可指定或回车随机）
 xg 3   # 查看节点链接
 xg 4   # 查看运行状态
 xg 5   # 卸载部署
@@ -117,7 +122,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 
 1. 自动识别系统包管理器，安装 `curl jq openssl unzip` 等依赖
 2. 从 GitHub 官方源下载 Xray-core（失败自动切 Cloudflare 安全代理），带 SHA-256 校验
-3. 生成自签证书、Reality 密钥对、UUID、随机端口（20000-60000）
+3. 生成自签证书、Reality 密钥对、UUID、端口（默认 30000-50000 随机，也可手动指定）
 4. 生成 `/etc/xray/config.json` 并做 `xray -test` 校验
 5. 写入服务（systemd / openrc / direct）并启动、开机自启
 6. 自动放行 ufw / firewalld / iptables 端口
@@ -125,13 +130,70 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 
 > 部署过程中若没有 Argo 配置，会询问是否顺带用 Cloudflare 邮箱 + API Key 自动搭建 Argo 隧道。
 
-### 方式三：自定义部署（可选协议）
+### 方式三：单独部署某个协议
+
+进菜单后按协议单独部署，互不影响：
+
+| 选项 | 作用 |
+| :--- | :--- |
+| `[1]` | 只部署 / 重部署 **Reality Vision**，会问端口 |
+| `[2]` | 只部署 / 重部署 **H3 直连**，会问端口 |
+| `[3]` | **Argo 自动搭建**（可单独使用，也可叠加在已有节点上） |
+
+命令行等价写法：
+
+```bash
+xg reality      # 只部署 Reality
+xg h3           # 只部署 H3
+xg argo         # 只搭 Argo
+```
+
+单独部署某个协议时，**其它已部署的协议会保留**，密钥与链接不变，不会掉线。
+
+### 方式四：自定义部署（一次选多个协议）
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go.sh) custom
 ```
 
 交互选择是否部署 Reality、H3、Argo，以及各自端口（回车自动随机）。
+
+### 端口写法（各部署入口通用）
+
+| 输入 | 含义 |
+| :--- | :--- |
+| 直接回车 | 30000-50000 随机端口，内外一致 |
+| `443` | 监听 443，节点也走 443 |
+| `443:31000` | **监听 443，节点对外 31000**（NAT / 端口映射） |
+
+`443:31000` 适用于云厂商端口转发、路由器 DNAT 这类场景：本机只在内部端口监听，客户端连的是映射出去的公网端口。配置里的 `port` 用前者，生成的链接用后者。
+
+冒号**中英文都识别**：`443:31000` 和 `443：31000` 效果相同，前后多余空格（含全角空格）也会自动去掉。
+
+状态页会显示成 `Reality=443→31000`，一眼能看出映射关系。
+
+### H3 的 SNI 与证书（可自定义）
+
+H3 走 TLS（QUIC），必须有一张证书。部署 H3 时脚本会多问两行：
+
+```
+  H3 SNI [回车 bing.com]:
+  证书 crt 路径 [回车自签]:
+```
+
+| 场景 | 怎么填 | 生成的链接 |
+| :--- | :--- | :--- |
+| 默认（自签） | 两行都回车 | `sni=bing.com&...&allowInsecure=1` |
+| 只换自签 SNI | 填 SNI，证书那行回车 | `sni=你填的域名&...&allowInsecure=1` |
+| 自备域名证书 | 填 SNI + crt / key 路径 | `sni=证书域名&...`（**不再带 allowInsecure**） |
+
+- 自签证书按 SNI 生成 `CN` 与 `SAN`（含 `DNS:<SNI>` 和服务器 IP），有效期 10 年
+- 填了 crt/key 但**没填 SNI** 时，脚本读证书的 `CN` 自动把 SNI 对齐过去，避免「证书是 a.com、SNI 写 b.com」导致客户端握手失败
+- 证书路径写错或文件不存在 → 自动退回自签，不会中断部署
+- 重新部署 Reality 不会改动已配置的 H3 SNI / 证书
+- `xg diag` 会打印证书 `CN` / `SAN` 和当前配置的 SNI，两者不一致会直接报警
+
+> SNI 只影响 TLS 握手的域名与证书校验，**不影响 UDP 能否到达服务器**。H3 完全不通时，先看 `xg diag` 里的 UDP 监听那几项。
 
 ### Argo 隧道：邮箱 + API Key 自动搭建（推荐）
 
@@ -150,7 +212,9 @@ xg 1        # 菜单 → [3] Argo 自动搭建
 xg argo     # 直接执行
 ```
 
-或在 `[1] 一键部署` / `[2] 自定义部署` 流程中按提示选择「自动搭建」。
+或在 `[1]` 部署 Reality / `[2]` 部署 H3 / `[3]` Argo 自动搭建 的流程中按提示选择。
+
+**可以只装 Argo，不装直连**：服务器上还没有任何部署时直接跑 `xg argo`（或菜单 `[3]`），脚本会创建「仅 Argo」节点——只生成 H2-Argo / H3-Argo 两条隧道节点，不开公网端口、不需要公网 IP。之后想要直连节点，再跑 `[1]` 一键部署即可。
 
 需要准备：
 
@@ -201,24 +265,52 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 
 | 选项 | 功能 |
 | :--- | :--- |
-| **[1] 一键部署** | Reality + H3，随机端口，全自动 |
-| **[2] 自定义部署** | 可选协议 / 端口 / Argo（自动或手动） |
-| **[3] Argo 自动搭建** | 已部署后补充/重建 Argo 隧道（CF 邮箱 + API Key） |
-| **[4] 删除 Argo 节点** | 停隧道 + 删云端隧道 + 删 DNS 解析 + 清本地配置 |
+| **[1] 部署 Reality** | 只部署 / 重部署 Reality Vision，端口可填 `443` / `443:31000` / 回车随机 |
+| **[2] 部署 H3** | 只部署 / 重部署 H3 直连，端口写法同上 |
+| **[3] Argo 自动搭建** | CF 邮箱 + API Key 建隧道。无部署时创建「仅 Argo」节点；已有部署时只补 Argo，不动现有直连 |
+| **[4] 删除节点** | 子菜单任选：删 Reality / 删 H3 / 删 Argo（含云端隧道 + DNS 解析） |
 | **[5] 查看节点链接** | 重新输出链接与 Base64 订阅 |
 | **[6] 服务控制** | 启动 / 停止 / 重启 / 重启 Argo / 状态 |
 | **[7] [8] 日志** | Xray 日志、Argo 日志实时查看 |
-| **[9] 检查配置** | `xray -test` 校验 `config.json` |
+| **[9] 诊断** | `xray -test` 校验配置 + 连通性自检（TCP/UDP 监听、防火墙、证书、日志、结论） |
 | **[10] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
-| **[11] 更新脚本** | 从仓库拉取最新管理脚本 |
-| **[12] 卸载部署** | 停服务、删云端隧道与 DNS、删本地全部文件 |
+| **[11] 更新脚本** | 从仓库拉取最新管理脚本，更新后显示 `V旧 -> V新` |
+| **[12] 卸载部署** | 与 `uninstall.sh` 等价：停服务 + 删云端隧道 + 删 DNS 解析 + 删本地全部文件 + 询问是否一并删 `xg` |
 
 命令行等价用法：
 
 ```bash
-xg 1..5                       # 数字快捷指令
-xg deploy | custom | argo | del-argo | links | status | start | stop | restart | log | check | update-core | update-script | uninstall
+xg 1..5                       # 命令行数字快捷指令（1 菜单 / 2 部署两者 / 3 链接 / 4 状态 / 5 卸载）
+xg reality | h3 | argo        # 只部署单个协议
+xg del-node | del-argo        # 删除节点（前者可选协议，后者直删 Argo）
+xg deploy | custom | links | status | start | stop | restart | log | check | diag | update-core | update-script | uninstall
 ```
+
+> 命令行数字（`xg 1`~`xg 5`）与菜单内编号（`[1]`~`[12]`）不是同一套，别混用。
+
+---
+
+## 🏷️ 版本与更新
+
+当前版本：**V1.1**（构建 2026-11-06）
+
+想确认自己装的是哪一版、更新有没有成功，看这三处任一处即可：
+
+```bash
+xg -v                 # 输出: Xray-go V1.1 (2026-11-06)
+xg status             # 状态页会显示「脚本版本 : V1.1 (2026-11-06)」
+xg                    # 菜单标题栏直接显示 V1.1
+```
+
+更新脚本时的反馈规则：
+
+| 情况 | 输出 |
+| :--- | :--- |
+| 远端版本更新 | `[成功] 脚本已更新: V1.0 -> V1.1` |
+| 远端版本相同 | `[成功] 当前已是最新版本 V1.1，无需更新。` |
+| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.1（版本号未变化）` |
+
+版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.1"`，改这里即可发新版。
 
 ---
 
@@ -240,20 +332,63 @@ xg deploy | custom | argo | del-argo | links | status | start | stop | restart |
 
 ## 🗑️ 一键卸载
 
+三种方式**完全等价，任选一条执行即可**，不需要都跑：
+
 ```bash
+xg 5        # 命令行快捷指令
+```
+
+```bash
+xg          # 进菜单后选 [12] 卸载部署
+```
+
+```bash
+# 不依赖本地命令，直接拉最新卸载脚本执行（xg 被删/脚本损坏时用这个）
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)
 ```
 
-或：
+菜单 `[12]` 与 `uninstall.sh` 的清理范围完全一致，都会做下面这些事：
+
+1. 停止并移除 Xray / Argo 服务（systemd unit、openrc 服务、direct 进程按 pidfile 精确 kill）
+2. **删除 Cloudflare 云端隧道**（`cascade=true`）**与对应的 DNS 解析记录**
+3. 无条件清理 systemd / openrc 的 unit 文件（不依赖当前运行模式判定，容器等混合环境也不会留残留）
+4. 删除 `/etc/xray`（配置、证书、密钥、cloudflared、`cf.json`、`argo.env`）、`/run/xraygo` 与 `/var/log/xray*.log`
+5. 最后询问是否一并删除管理命令 `/usr/local/bin/xg`（默认保留）
+
+**会保留的**：系统依赖（`curl` / `jq` / `openssl` / `unzip`）、`/usr/local/bin/xg`（第 4 步选 `y` 才删）。
+
+**唯一需要手动收尾**：Argo 是手动填 Token 部署的（`meta.json` 里没有 `tunnel_id`），脚本无从得知隧道归属，卸载时会提示你去 Cloudflare 控制台手动删隧道与 DNS。
+
+---
+
+## 🔧 H3 不通怎么排查
+
+H3 走 **UDP**，和 Reality 的 TCP 是两条完全独立的通道。菜单 `[9]` 或 `xg diag` 会自动跑完下面第 1~3 项并给出结论。
+
+**1. 服务端到底有没有监听 UDP**
 
 ```bash
-xg 5
+ss -lunp | grep -E ':(443|你的端口)\b'
 ```
 
-卸载会依次执行：
+- 有 `UNCONN ... 0.0.0.0:443` → 服务端在监听，问题在后面几项
+- 完全没有 UDP 记录 → 核心没起 QUIC 监听，通常是 **Xray 版本低于 1.8.19**，用菜单 `[10]` 更新核心后重启
 
-1. 停止并移除 Xray / Argo 服务（systemd / openrc / direct 进程）
-2. **删除 Cloudflare 云端隧道**（`cascade=true`）**与对应的 DNS 解析记录**
-3. 删除 `/etc/xray`（配置、证书、密钥、cloudflared、`cf.json`、`argo.env`）、`/run/xraygo` 与日志
+**2. 防火墙与云安全组**
 
-管理命令 `xg` 会保留（如需删除：`rm -f /usr/local/bin/xg`）。
+本机 `ufw` / `firewalld` / `iptables` 脚本会自动放行 TCP 和 UDP，但**云厂商安全组需要你手动加 UDP 规则**——这一步最容易漏。
+
+**3. NAT 映射有没有带 UDP**
+
+用了 `443:31000` 这种写法时，云厂商端口转发 / 路由器 DNAT 必须**同时映射 TCP 和 UDP**。只映射 TCP 时 Reality 能通、H3 一定不通，这是最常见的坑。
+
+**4. 客户端版本与参数**
+
+- v2rayN 的 Xray 内核需 **1.8.19+**（建议 25.x）
+- 传输层选 `xhttp`，ALPN 填 `h3`
+- SNI 必须和证书域名一致：自签时用链接里的 `sni`，自备证书时用证书上的域名（不一致会握手失败，`xg diag` 会提示）
+- 链接里带 `allowInsecure=1` 表示自签证书；Clash Meta 对应 `skip-cert-verify: true`。用自备域名证书时链接不带该参数，请保持证书校验开启
+
+**5. 运营商 UDP 限制**
+
+部分网络会限速或封锁 UDP 443。换个端口（比如 `8443`）试；仍不行就走 Reality 或 Argo，这两条不依赖 UDP 直连。
