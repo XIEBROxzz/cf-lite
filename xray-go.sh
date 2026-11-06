@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.0"
+export SCRIPT_VERSION="2.1"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -602,6 +602,34 @@ EOF
     chmod 755 "$SERVICE_FILE" 2>/dev/null || true
 }
 
+# 服务文件是不是本脚本写的？
+# CF-A（xray_cf_lite.sh）用的就是 /etc/systemd/system/xray.service（官方 unit），
+# 它的卸载只删自己的 config、不删 unit，于是本脚本会「以为服务已存在」而直接启动，
+# 结果跑的是 CF-A 的 ExecStart=/usr/local/bin/xray，配置早被删了 → 秒退 + 重启循环。
+_service_file_is_ours() {
+    [ -f "$SERVICE_FILE" ] || return 1
+    grep -qF "ExecStart=${XRAY_BIN}" "$SERVICE_FILE" 2>/dev/null && return 0
+    grep -qF "command=\"${XRAY_BIN}\"" "$SERVICE_FILE" 2>/dev/null && return 0
+    return 1
+}
+
+# 启动/重启前确保服务文件归自己；被别人占着就重写（幂等，可反复调用）
+_ensure_service_owned() {
+    if _service_file_is_ours; then
+        # 顺手补回开机自启：CF-A 卸载时执行过 systemctl disable xray
+        case "$INIT_SYSTEM" in
+            systemd) systemctl enable xray >/dev/null 2>&1 || true ;;
+            openrc)  rc-update add xray default >/dev/null 2>&1 || true ;;
+        esac
+        return 0
+    fi
+    if [ -f "$SERVICE_FILE" ]; then
+        _warn "检测到 ${SERVICE_FILE} 不是本脚本写的（多为 CF-A 遗留），正在重写为本脚本的服务。"
+    fi
+    _create_service_files
+    _service_file_is_ours
+}
+
 _create_service_files() {
     mkdir -p "$RUNTIME_DIR" 2>/dev/null
     chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
@@ -609,6 +637,11 @@ _create_service_files() {
 
     case "$INIT_SYSTEM" in
         systemd)
+            # CF-A（xray_cf_lite.sh）用同一个 unit 路径，且会在 xray.service.d/ 里留
+            # RestartSec=1 的 drop-in。接管前先清掉，否则失败后会 1 秒一重启，日志刷爆。
+            if [ -d "${SERVICE_FILE}.d" ] && ! _service_file_is_ours; then
+                rm -rf "${SERVICE_FILE}.d" 2>/dev/null || true
+            fi
             _info "正在创建 systemd 服务..."
             _write_systemd_service
             systemctl daemon-reload >/dev/null 2>&1 || true
@@ -674,7 +707,7 @@ _manage_service() {
     case "$INIT_SYSTEM" in
         systemd)
             if [[ "$action" == "start" || "$action" == "restart" ]]; then
-                [ -f "$SERVICE_FILE" ] || _create_service_files
+                _ensure_service_owned || { _error "服务文件写入失败，无法启动。"; return 1; }
             fi
             if [ "$action" == "status" ]; then
                 systemctl status xray --no-pager -l
@@ -688,7 +721,7 @@ _manage_service() {
             ;;
         openrc)
             if [[ "$action" == "start" || "$action" == "restart" ]]; then
-                [ -f "$SERVICE_FILE" ] || _create_service_files
+                _ensure_service_owned || { _error "服务文件写入失败，无法启动。"; return 1; }
             fi
             if [ "$action" == "status" ]; then
                 rc-service xray status
@@ -1582,6 +1615,14 @@ _diag() {
     else
         echo -e "  Argo     : ${RED}未运行${NC}" >&2
     fi
+    # 服务文件被别人占着时，本脚本怎么启都是启别人的服务（CF-A 遗留的典型症状）
+    if [ -n "$SERVICE_FILE" ] && [ -f "$SERVICE_FILE" ]; then
+        if _service_file_is_ours; then
+            echo -e "  服务文件 : 正常（本脚本）" >&2
+        else
+            echo -e "  服务文件 : ${RED}被其他脚本占用${NC}（${SERVICE_FILE}）" >&2
+        fi
+    fi
 
     if [ ! -s "$META_FILE" ]; then
         _warn "尚未部署，无法继续自检。"
@@ -1638,6 +1679,11 @@ _diag() {
         issues=$((issues + 1))
         _error "Xray 没有在 127.0.0.1:${ap} 监听 —— cloudflared 转进来的流量无处可去。"
         echo -e "     处理：菜单 [8] 重建配置，或查看 ${LOG_FILE}。" >&2
+    fi
+    if [ -n "$SERVICE_FILE" ] && [ -f "$SERVICE_FILE" ] && ! _service_file_is_ours; then
+        issues=$((issues + 1))
+        _error "服务文件 ${SERVICE_FILE} 不是本脚本写的 —— 启动的是别人的 xray，配置对不上就会秒退重启。"
+        echo -e "     处理：${CYAN}xg restart${NC}（或菜单 [4] → 重启），会自动重写服务文件。" >&2
     fi
     if ! _service_is_running; then
         issues=$((issues + 1))
@@ -1911,6 +1957,9 @@ _rebuild_config() {
         return 1
     fi
     [ -n "$bak" ] && rm -f "$bak"
+
+    # 服务文件被 CF-A 之类占着时，这里顺手重写（否则下面重启只会拉起别人的服务）
+    _ensure_service_owned || _warn "服务文件修复失败，请手动检查: ${SERVICE_FILE}"
 
     if _service_is_running; then
         _info "正在重启 Xray 服务..."

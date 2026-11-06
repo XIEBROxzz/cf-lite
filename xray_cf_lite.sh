@@ -103,7 +103,24 @@ INITEOF
 
 svc_enable()    { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl enable xray &>/dev/null; else rc-update add xray default &>/dev/null; fi; true; }
 svc_start()     { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else [[ -f "$XRAY_OPENRC_SCRIPT" ]] || write_openrc_script; rc-service xray restart; fi; }
-svc_stop()      { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl stop xray &>/dev/null; systemctl disable xray &>/dev/null; else rc-service xray stop &>/dev/null; rc-update del xray default &>/dev/null; fi; true; }
+# 服务文件是否被别的脚本占用（CF-C / xray-go 用同一个 xray 服务名与 unit 路径）
+# 命中时绝不动它：否则卸载 CF-A 会把 CF-C 的服务一起 stop + disable，CF-C 就起不来了
+svc_is_foreign() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        [[ -f /etc/systemd/system/xray.service ]] || return 1
+        ! grep -q "/usr/local/bin/xray" /etc/systemd/system/xray.service 2>/dev/null
+    else
+        [[ -f /etc/init.d/xray ]] || return 1
+        ! grep -q "/usr/local/bin/xray" /etc/init.d/xray 2>/dev/null
+    fi
+}
+svc_stop()      {
+    if svc_is_foreign; then
+        info "xray 服务由其他脚本托管（如 CF-C/xg），已跳过停止与禁用"
+        return 0
+    fi
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl stop xray &>/dev/null; systemctl disable xray &>/dev/null; else rc-service xray stop &>/dev/null; rc-update del xray default &>/dev/null; fi; true
+}
 svc_is_active() { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active xray &>/dev/null; else rc-service xray status &>/dev/null 2>&1; fi; }
 
 ensure_systemd_restart() {
