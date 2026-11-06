@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.6"
+export SCRIPT_VERSION="2.7"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -558,10 +558,11 @@ _count_edge_conns() {
 _collect_argo_logtext() {
     local text="" f
 
-    [ -s "$ARGO_LOG_FILE" ] && text=$(tail -n 500 "$ARGO_LOG_FILE" 2>/dev/null)
+    # 取够长的尾巴：注册日志在启动时，日志跑久了会被挤出 tail -300 的范围
+    [ -s "$ARGO_LOG_FILE" ] && text=$(tail -n 2000 "$ARGO_LOG_FILE" 2>/dev/null)
 
     if [ -z "$text" ] && command -v journalctl >/dev/null 2>&1; then
-        text=$(journalctl -u xray-argo -n 500 --no-pager 2>/dev/null)
+        text=$(journalctl -u xray-argo -n 2000 --no-pager 2>/dev/null)
     fi
 
     # openrc 下日志可能被 supervise-daemon 丢进 syslog
@@ -596,12 +597,12 @@ _argo_transport() {
 
     # 日志是累积的（每次重启都会再注册一批），只看「最近一次启动」之后的那批，
     # 否则跨重启混在一起会把「以前用过 http2」误判成「现在在回退」。
+    # 批次边界不止 Starting tunnel：有的版本/日志源会漏掉它，所以把启动时的
+    # Settings / Initial protocol 也当边界，只要命中任意一个就从头累积。
     local batch=""
-    if printf '%s' "$logtext" | grep -q 'Starting tunnel'; then
-        batch=$(printf '%s\n' "$logtext" | awk '/Starting tunnel/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}')
-    else
-        batch="$logtext"
-    fi
+    batch=$(printf '%s\n' "$logtext" \
+        | awk '/Starting tunnel|Initial protocol|Settings: map\[/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}')
+    [ -n "$batch" ] || batch="$logtext"
     local mix_q=0 mix_h=0 mix_n=0
     if [ -n "$batch" ]; then
         mix_q=$(printf '%s\n' "$batch" | grep -c 'protocol=quic')
@@ -1805,6 +1806,13 @@ _diag() {
         echo -e "     ${CYAN}cloudflared 在跑但数不到连接${NC}：本机没有 ss/netstat，内核表也读不到。" >&2
         echo -e "     不影响使用，可看 ${CYAN}xg argo-log${NC} 里的 protocol=xxx。" >&2
     fi
+    if [ "${at_state:-}" = "unknown" ] && _argo_is_running; then
+        local lsz
+        lsz=$(wc -c < "$ARGO_LOG_FILE" 2>/dev/null | tr -d ' ')
+        echo -e "     ${CYAN}诊断${NC}：日志 ${ARGO_LOG_FILE} 共 ${lsz:-0} 字节" >&2
+        echo -e "     为 0 → cloudflared 没往这里写（openrc 下可能进了 syslog）" >&2
+        echo -e "     非 0 → ${CYAN}grep -c 'Registered tunnel connection' ${ARGO_LOG_FILE}${NC} 看有没有注册记录" >&2
+    fi
 
     # cloudflared 每个请求都带 X-Forwarded-For；核心没声明信任来源就刷 Error（无害但很吵）
     # 注意日志原文是 "ignored potentially forged \"X-Forwarded-For\""，不是 trustedXForwardedFor
@@ -2072,13 +2080,22 @@ _show_status() {
     fi
 
     if [ -s "$META_FILE" ]; then
-        local st
-        st=$(_argo_transport 2>/dev/null | cut -d$'\x1f' -f1)
+        local st at_cfg
+        IFS=$'\x1f' read -r st at_cfg _ < <(_argo_transport 2>/dev/null)
         case "$st" in
             quic)     echo -e "  Argo 传输: ${GREEN}QUIC (UDP)${NC}" >&2 ;;
             http2)    echo -e "  Argo 传输: ${YELLOW}HTTP/2 (TCP)${NC}" >&2 ;;
+            mixed)    echo -e "  Argo 传输: ${YELLOW}QUIC + HTTP/2 混合${NC}" >&2 ;;
             fallback) echo -e "  Argo 传输: ${RED}QUIC 已回退 HTTP/2${NC}" >&2 ;;
-            *)        echo -e "  Argo 传输: ${YELLOW}未知${NC}" >&2 ;;
+            *)
+                # 连接计数和日志都没取到，退而用进程参数：只说明「被要求用什么」，
+                # 不代表实际传输，所以标注清楚来源
+                if [ -n "${at_cfg:-}" ]; then
+                    echo -e "  Argo 传输: ${YELLOW}${at_cfg}${NC} （进程参数，未取到连接/日志）" >&2
+                else
+                    echo -e "  Argo 传输: ${YELLOW}未知${NC} （可执行 ${CYAN}xg diag${NC} 查看原因）" >&2
+                fi
+                ;;
         esac
         echo -e "  隧道     : $(jq -r 'if (.argo_port // 0) > 0 then ((.argo_domain // "-") + "  (" + (.argo_protocol // "http2") + " / 127.0.0.1:" + (.argo_port | tostring) + ")") else "未配置" end' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
