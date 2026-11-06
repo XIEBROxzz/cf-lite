@@ -151,6 +151,9 @@ case "${1:-}" in
     "")
         # 安装完直接进入主菜单，不再显示中间的 1-5 选择界面
         if [ -t 0 ]; then
+            if [ ! -s /etc/xray/meta.json ]; then
+                _info "管理命令已就绪，但尚未部署。进入菜单后请选择 [1] 部署，或退出执行: xg deploy"
+            fi
             exec "$TARGET_BIN" menu
         else
             _info "非交互环境，可手动执行: xg（菜单）/ xg 2（一键部署）"
