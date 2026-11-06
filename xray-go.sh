@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.13"
+export SCRIPT_VERSION="2.14"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -1211,6 +1211,147 @@ KEEPEOF
     chmod 755 "$KEEPALIVE_SCRIPT" 2>/dev/null || true
 }
 
+KEEPALIVE_LOOP="${XRAY_DIR}/argo-keepalive-loop.sh"
+
+# 保活守护服务的服务文件路径（随 init 系统不同）
+_keepalive_service_file() {
+    case "$INIT_SYSTEM" in
+        systemd) echo "/etc/systemd/system/xray-keepalive.service" ;;
+        openrc)  echo "/etc/init.d/xray-keepalive" ;;
+        *)       echo "" ;;
+    esac
+}
+
+# 循环脚本：cron 不可用时由守护服务托管，每 INTERVAL 秒调一次巡检
+_write_keepalive_loop() {
+    local interval="$1"
+    cat > "$KEEPALIVE_LOOP" <<'LOOPEOF'
+#!/bin/sh
+# Xray-go Argo 保活循环（由 xray-keepalive 服务托管，请勿手改）
+INTERVAL=@INTERVAL@
+while true; do
+    /bin/sh @SCRIPT@
+    sleep "$INTERVAL"
+done
+LOOPEOF
+    sed -i -e "s#@INTERVAL@#${interval}#g" -e "s#@SCRIPT@#${KEEPALIVE_SCRIPT}#g" \
+        "$KEEPALIVE_LOOP" 2>/dev/null || true
+    chmod 755 "$KEEPALIVE_LOOP" 2>/dev/null || true
+}
+
+_write_keepalive_service() {
+    local sf
+    sf=$(_keepalive_service_file)
+    [ -n "$sf" ] || return 1
+    case "$INIT_SYSTEM" in
+        systemd)
+            cat > "$sf" <<EOF
+[Unit]
+Description=Xray-go Argo Keepalive
+After=network.target xray-argo.service
+
+[Service]
+Type=simple
+ExecStart=${KEEPALIVE_LOOP}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            chmod 600 "$sf" 2>/dev/null || true
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            if command -v supervise-daemon >/dev/null 2>&1; then
+                cat > "$sf" <<EOF
+#!/sbin/openrc-run
+description="Xray-go Argo Keepalive"
+supervisor="supervise-daemon"
+command="${KEEPALIVE_LOOP}"
+respawn_delay=10
+respawn_max=0
+output_log="/var/log/xray-keepalive.log"
+error_log="/var/log/xray-keepalive.log"
+
+depend() {
+    need net
+    after xray-argo
+}
+EOF
+            else
+                cat > "$sf" <<EOF
+#!/sbin/openrc-run
+description="Xray-go Argo Keepalive"
+command="${KEEPALIVE_LOOP}"
+command_background="yes"
+pidfile="${RUNTIME_DIR}/keepalive.pid"
+output_log="/var/log/xray-keepalive.log"
+error_log="/var/log/xray-keepalive.log"
+
+depend() {
+    need net
+    after xray-argo
+}
+EOF
+            fi
+            chmod 755 "$sf" 2>/dev/null || true
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+_keepalive_service_running() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet xray-keepalive 2>/dev/null ;;
+        openrc)  rc-service xray-keepalive status 2>/dev/null | grep -q started ;;
+        *)       return 1 ;;
+    esac
+}
+
+_keepalive_service_start() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl enable xray-keepalive >/dev/null 2>&1 || true
+            systemctl reset-failed xray-keepalive >/dev/null 2>&1 || true
+            systemctl restart xray-keepalive >/dev/null 2>&1
+            ;;
+        openrc)
+            mkdir -p "$RUNTIME_DIR" 2>/dev/null
+            rc-update add xray-keepalive default >/dev/null 2>&1 || true
+            rc-service xray-keepalive stop >/dev/null 2>&1 || true
+            rc-service xray-keepalive start >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_keepalive_service_stop() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl disable --now xray-keepalive >/dev/null 2>&1 || true
+            systemctl reset-failed xray-keepalive >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            rc-service xray-keepalive stop >/dev/null 2>&1 || true
+            rc-update del xray-keepalive default >/dev/null 2>&1 || true
+            ;;
+    esac
+    return 0
+}
+
+# 当前保活走的是哪条路：cron（轻量）/ service（零依赖）/ none
+_keepalive_mode() {
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "$KEEPALIVE_SCRIPT"; then
+        echo "cron"
+    elif _keepalive_service_running; then
+        echo "service"
+    else
+        echo "none"
+    fi
+}
+
 # cron 命令在、服务也在跑才算可用（Alpine 是 dcron，Debian 是 cron）
 _ensure_cron_service() {
     local s started=false pkg="cron"
@@ -1255,8 +1396,7 @@ _ensure_cron_service() {
 }
 
 _watchdog_enabled() {
-    command -v crontab >/dev/null 2>&1 || return 1
-    crontab -l 2>/dev/null | grep -Fq "$KEEPALIVE_SCRIPT"
+    [ "$(_keepalive_mode)" != "none" ]
 }
 
 _enable_argo_watchdog() {
@@ -1267,45 +1407,65 @@ _enable_argo_watchdog() {
         *) interval=60 ;;
     esac
     _write_keepalive_script "$INIT_SYSTEM" || return 1
-    if ! _ensure_cron_service; then
-        _warn "cron 不可用，保活未启用（服务托管层仍会兜底）。"
-        return 1
-    fi
-    # 先摘掉旧条目：改间隔时不会叠加出重复任务
-    if _watchdog_enabled; then
-        crontab -l 2>/dev/null | grep -Fv "$KEEPALIVE_SCRIPT" | crontab - 2>/dev/null || true
-    fi
-    # 60 秒 → 1 条；30 秒 → 2 条（第 2 条先 sleep 30）；15 秒 → 4 条
-    slots=$((60 / interval))
-    [ "$slots" -ge 1 ] || slots=1
-    i=0
-    while [ "$i" -lt "$slots" ]; do
-        off=$((i * interval))
-        if [ "$off" -eq 0 ]; then
-            lines="${lines}* * * * * /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1
-"
-        else
-            lines="${lines}* * * * * sleep ${off}; /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1
-"
+    printf '%s\n' "$interval" > "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null || true
+    chmod 600 "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null || true
+
+    # 优先 cron：每次只 fork 一个 sh，不占常驻内存。
+    # 装不上 cron 的机器（很多精简 Alpine / LXD 容器）走下面的守护服务。
+    if _ensure_cron_service 2>/dev/null; then
+        # 先摘旧条目：改间隔时不会叠加出重复任务
+        if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "$KEEPALIVE_SCRIPT"; then
+            crontab -l 2>/dev/null | grep -Fv "$KEEPALIVE_SCRIPT" | crontab - 2>/dev/null || true
         fi
-        i=$((i + 1))
-    done
-    if (crontab -l 2>/dev/null; printf '%s' "$lines") | crontab - 2>/dev/null; then
-        printf '%s\n' "$interval" > "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null || true
-        chmod 600 "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null || true
-        _success "Argo 保活已启用：每 ${interval} 秒巡检，进程退出或无边缘连接时自动重启。"
+        # 60 秒 → 1 条；30 秒 → 2 条（第 2 条先 sleep 30）；15 秒 → 4 条
+        slots=$((60 / interval))
+        [ "$slots" -ge 1 ] || slots=1
+        i=0
+        while [ "$i" -lt "$slots" ]; do
+            off=$((i * interval))
+            if [ "$off" -eq 0 ]; then
+                lines="${lines}* * * * * /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1
+"
+            else
+                lines="${lines}* * * * * sleep ${off}; /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1
+"
+            fi
+            i=$((i + 1))
+        done
+        if (crontab -l 2>/dev/null; printf '%s' "$lines") | crontab - 2>/dev/null; then
+            # 清掉可能残留的守护服务，避免双份巡检
+            _keepalive_service_stop
+            _success "Argo 保活已启用：cron，每 ${interval} 秒巡检一次。"
+            return 0
+        fi
+        _warn "crontab 写入失败，改用守护服务。"
+    fi
+
+    # cron 不可用（没装 / 装不上 / 服务起不来）→ 零依赖的守护服务
+    _write_keepalive_loop "$interval" || return 1
+    _write_keepalive_service || { _error "无法写入保活服务文件。"; return 1; }
+    _keepalive_service_start
+    sleep 2
+    if _keepalive_service_running; then
+        _success "Argo 保活已启用：守护服务，每 ${interval} 秒巡检一次。"
         return 0
     fi
-    _warn "写入 crontab 失败，保活未启用。"
+    _error "保活启用失败：cron 不可用，守护服务也没起来。"
+    _info "可手动排查：rc-service xray-keepalive start（日志 /var/log/xray-keepalive.log）"
     return 1
 }
 
 _disable_argo_watchdog() {
-    if _watchdog_enabled; then
+    local sf
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -Fq "$KEEPALIVE_SCRIPT"; then
         crontab -l 2>/dev/null | grep -Fv "$KEEPALIVE_SCRIPT" | crontab - 2>/dev/null || true
-        _info "Argo 保活已移除。"
     fi
-    rm -f "$KEEPALIVE_SCRIPT" 2>/dev/null || true
+    _keepalive_service_stop
+    sf=$(_keepalive_service_file)
+    [ -n "$sf" ] && rm -f "$sf" 2>/dev/null
+    rm -f "$KEEPALIVE_SCRIPT" "$KEEPALIVE_LOOP" 2>/dev/null || true
+    [ "$INIT_SYSTEM" = "systemd" ] && systemctl daemon-reload >/dev/null 2>&1 || true
+    _info "Argo 保活已移除。"
     return 0
 }
 
@@ -2082,11 +2242,11 @@ _diag() {
         fi
     fi
     # 保活状态：没开的话 Argo 崩了只能人工拉
-    if _watchdog_enabled; then
-        echo -e "  自动保活 : ${GREEN}已开启${NC}（每 $(_keepalive_interval) 秒巡检）" >&2
-    else
-        echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on 30${NC}）" >&2
-    fi
+    case "$(_keepalive_mode)" in
+        cron)    echo -e "  自动保活 : ${GREEN}已开启${NC}（cron，每 $(_keepalive_interval) 秒）" >&2 ;;
+        service) echo -e "  自动保活 : ${GREEN}已开启${NC}（守护服务，每 $(_keepalive_interval) 秒）" >&2 ;;
+        *)       echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on 30${NC}）" >&2 ;;
+    esac
 
     if [ ! -s "$META_FILE" ]; then
         _warn "尚未部署，无法继续自检。"
@@ -2468,13 +2628,14 @@ _show_status() {
         esac
         echo -e "  隧道     : $(jq -r 'if (.argo_port // 0) > 0 then ((.argo_domain // "-") + "  (" + (.argo_protocol // "http2") + " / 127.0.0.1:" + (.argo_port | tostring) + ")") else "未配置" end' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
-        if _watchdog_enabled; then
-            echo -e "  自动保活 : ${GREEN}已开启${NC}（每 $(_keepalive_interval) 秒巡检，崩溃自动拉起）" >&2
-        elif [ -x "$KEEPALIVE_SCRIPT" ]; then
-            echo -e "  自动保活 : ${YELLOW}脚本在但 cron 未挂${NC}（${CYAN}xg keepalive-on 30${NC}）" >&2
-        else
-            echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on 30${NC} 开启）" >&2
-        fi
+        case "$(_keepalive_mode)" in
+            cron)
+                echo -e "  自动保活 : ${GREEN}已开启${NC}（cron，每 $(_keepalive_interval) 秒）" >&2 ;;
+            service)
+                echo -e "  自动保活 : ${GREEN}已开启${NC}（守护服务，每 $(_keepalive_interval) 秒）" >&2 ;;
+            *)
+                echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on 30${NC} 开启）" >&2 ;;
+        esac
     else
         echo -e "  隧道     : ${YELLOW}尚未部署${NC}" >&2
     fi
