@@ -1,4 +1,5 @@
 ## 🗂️ 三套方案：CF-A / CF-B / CF-C
+**前置环境**
 ```bash
 apk update && apk add curl wget net-tools procps bash
 ```
