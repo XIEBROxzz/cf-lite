@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.11"
+export SCRIPT_VERSION="2.12"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -1012,11 +1012,16 @@ _argo_action() {
     local action="$1"
     local proto conns token
     proto=$(jq -r '.argo_protocol // "http2"' "$META_FILE" 2>/dev/null)
-    token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
     [ -n "$proto" ] || proto="http2"
     conns=$(_argo_connections "$proto")
 
-    [ -n "$token" ] || { _error "未配置 Argo Token，跳过 Argo 操作。"; return 1; }
+    _argo_deployed || { _error "尚未部署 Argo（meta.json 无 token，argo.env 无 TUNNEL_TOKEN）。"; return 1; }
+
+    # direct 模式靠环境变量传 token；systemd/openrc 直接读 argo.env，这里只是兜底
+    token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
+    if [ -z "$token" ] && [ -s "$ARGO_ENV_FILE" ]; then
+        token=$(sed -n 's/^TUNNEL_TOKEN=//p' "$ARGO_ENV_FILE" 2>/dev/null | head -n1)
+    fi
 
     case "$INIT_SYSTEM" in
         systemd)
@@ -1110,7 +1115,10 @@ ARGO_PID="@ARGO_PID@"
 STRIKE="$STATE/argo-keepalive.strike"
 
 [ -s "$META" ] || exit 0
-grep -q 'argo_token' "$META" 2>/dev/null || exit 0
+# 已部署判据：meta 里有 argo_token（自动搭建），或 argo.env 里有 TUNNEL_TOKEN（手动部署）
+if ! grep -q 'argo_token' "$META" 2>/dev/null; then
+    [ -s "$STATE/argo.env" ] && grep -q '^TUNNEL_TOKEN=..*' "$STATE/argo.env" 2>/dev/null || exit 0
+fi
 
 # 上一轮还没跑完就跳过，避免 cron 叠加
 if command -v flock >/dev/null 2>&1; then
@@ -1213,7 +1221,10 @@ _ensure_cron_service() {
         command -v yum >/dev/null 2>&1 && pkg="cronie"
         _info "正在安装 cron 依赖: ${pkg} ..."
         _pkg_install "$pkg" >/dev/null 2>&1 || true
-        command -v crontab >/dev/null 2>&1 || return 1
+        if ! command -v crontab >/dev/null 2>&1; then
+            _warn "crontab 命令仍不可用，cron 包没装上（检查软件源或手动执行: apk add dcron）"
+            return 1
+        fi
     fi
     case "$INIT_SYSTEM" in
         systemd)
@@ -1237,7 +1248,10 @@ _ensure_cron_service() {
             done
             ;;
     esac
-    [ "$started" = true ]
+    [ "$started" = true ] && return 0
+    _warn "cron 服务启动失败（依次试过 cron / crond / cronie），crontab 存在但任务不会执行"
+    _info "手动排查：rc-service dcron start（Alpine）或 systemctl start cron（Debian）"
+    return 1
 }
 
 _watchdog_enabled() {
@@ -1991,21 +2005,31 @@ _argo_is_running() {
 }
 
 
+# 是否部署过 Argo。
+# 自动搭建（CF 邮箱 + API Key）会把 token 写进 meta.json；手动 Token 部署只写
+# argo.env。只认 meta 会让后一种情况被判定成"未部署"，从而静默跳过拉起。
+_argo_deployed() {
+    [ -s "$META_FILE" ] || return 1
+    local tok
+    tok=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
+    [ -n "$tok" ] && return 0
+    [ -s "$ARGO_ENV_FILE" ] || return 1
+    grep -q '^TUNNEL_TOKEN=..*' "$ARGO_ENV_FILE" 2>/dev/null
+}
+
+
 # 已部署 Argo 但进程没在跑时，顺手拉起来。
 # 典型场景：跑大流量时 cloudflared 被 OOM kill / --retries 耗尽退出，
 # openrc 老模板没有 supervise-daemon，崩了就再也不会自己起来。
 _ensure_argo_running() {
-    [ -s "$META_FILE" ] || return 0
-    local token
-    token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
-    [ -n "$token" ] || return 0
+    _argo_deployed || return 0
     _argo_is_running && return 0
     _warn "Argo 隧道当前未运行，正在拉起..."
     if _argo_action restart; then
         _success "Argo 隧道已恢复。"
         return 0
     fi
-    _error "Argo 隧道拉起失败，执行 xg argo-log 查看原因。"
+    _error "Argo 隧道拉起失败，执行 xg diag / xg argo-log 查看原因。"
     return 1
 }
 
@@ -2044,6 +2068,12 @@ _diag() {
         else
             echo -e "  服务文件 : ${RED}被其他脚本占用${NC}（${SERVICE_FILE}）" >&2
         fi
+    fi
+    # 保活状态：没开的话 Argo 崩了只能人工拉
+    if _watchdog_enabled; then
+        echo -e "  自动保活 : ${GREEN}已开启${NC}（每 $(_keepalive_interval) 秒巡检）" >&2
+    else
+        echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on 30${NC}）" >&2
     fi
 
     if [ ! -s "$META_FILE" ]; then
@@ -2154,6 +2184,14 @@ _diag() {
         issues=$((issues + 1))
         _error "cloudflared 未运行，Cloudflare 边缘无法把流量送到本机。"
         echo -e "     处理：${CYAN}xg restart${NC}（会顺带拉起 Argo），或 ${CYAN}xg argo-log${NC} 看退出原因。" >&2
+
+        # 凭据是否齐全：没有 TUNNEL_TOKEN 的话，怎么重启都起不来
+        if _argo_deployed; then
+            echo -e "     凭据：已找到 TUNNEL_TOKEN（meta.json 或 argo.env）" >&2
+        else
+            echo -e "     ${RED}凭据缺失${NC}：meta.json 无 argo_token，argo.env 无 TUNNEL_TOKEN" >&2
+            echo -e "     此时无法自动拉起，需要重新部署：${CYAN}xg deploy${NC}" >&2
+        fi
 
         # 大流量下崩溃最常见的原因是 OOM，先看一眼内核有没有留证据
         local oom=""
@@ -2653,6 +2691,10 @@ main() {
             _manage_service "$cmd"
             if [ "$cmd" != "stop" ]; then
                 _ensure_argo_running
+                # 保活没开就顺手补上：更新脚本不会重新部署，光靠 deploy 分支开不起来
+                if _argo_deployed && ! _watchdog_enabled; then
+                    _enable_argo_watchdog || _warn "保活未启用，稍后可手动: xg keepalive-on 30"
+                fi
             fi
             ;;
         log)
