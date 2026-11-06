@@ -1489,12 +1489,20 @@ _deploy_all() {
 
     _gen_certificate || return 1
 
-    local keypair private_key public_key short_id
-    _info "正在生成 Reality 密钥对..."
-    keypair=$(_gen_reality_keypair) || { _error "生成 Reality 密钥对失败。"; return 1; }
-    private_key="${keypair%% *}"
-    public_key="${keypair##* }"
-    short_id=$(openssl rand -hex 4)
+    local keypair private_key="" public_key="" short_id=""
+    # 已有 Reality 密钥则沿用，避免只重部署 H3 时把 Reality 的 pbk/sid 换掉导致客户端失效
+    if [ -s "$META_FILE" ]; then
+        private_key=$(jq -r '.reality_private_key // ""' "$META_FILE" 2>/dev/null)
+        public_key=$(jq -r '.reality_public_key // ""' "$META_FILE" 2>/dev/null)
+        short_id=$(jq -r '.reality_short_id // ""' "$META_FILE" 2>/dev/null)
+    fi
+    if [ "$reality_port" != "0" ] && { [ -z "$private_key" ] || [ -z "$public_key" ]; }; then
+        _info "正在生成 Reality 密钥对..."
+        keypair=$(_gen_reality_keypair) || { _error "生成 Reality 密钥对失败。"; return 1; }
+        private_key="${keypair%% *}"
+        public_key="${keypair##* }"
+    fi
+    [ -n "$short_id" ] || short_id=$(openssl rand -hex 4)
 
     local h3_path="${uuid}-xu"
     local argo_path="${uuid}-argo"
@@ -1945,6 +1953,177 @@ _argo_delete_node() {
     return 0
 }
 
+# 单独部署 / 重部署直连协议（reality | h3），保留其它已部署协议不受影响
+_deploy_single_proto() {
+    local kind="$1"
+    _check_root
+    _detect_init_system
+
+    local reality_port=0 reality_public=0 h3_port=0 h3_public=0
+    local argo_port=0 argo_domain="" argo_protocol="http2" argo_token="" tid="" zid=""
+    if [ -s "$META_FILE" ]; then
+        IFS=$'\x1f' read -r reality_port reality_public h3_port h3_public argo_port argo_domain argo_protocol argo_token tid zid < <(
+            jq -r '[((.reality_port // 0) | tostring),
+                    ((.reality_public_port // .reality_port // 0) | tostring),
+                    ((.h3_port // 0) | tostring),
+                    ((.h3_public_port // .h3_port // 0) | tostring),
+                    ((.argo_port // 0) | tostring),
+                    (.argo_domain // ""), (.argo_protocol // "http2"),
+                    (.argo_token // ""), (.argo_tunnel_id // ""), (.argo_zone_id // "")]
+                   | join("\u001f")' "$META_FILE" 2>/dev/null
+        )
+    fi
+
+    local label input spec listen pub
+    case "$kind" in
+        reality) label="Reality" ;;
+        h3)      label="H3" ;;
+        *)       _error "未知协议: ${kind}"; return 1 ;;
+    esac
+
+    echo "" >&2
+    if [ "$kind" = "reality" ] && [ "${reality_port:-0}" != "0" ]; then
+        _warn "Reality 已在运行（$(_port_desc "$reality_port" "$reality_public")），重新部署会更换端口。"
+    fi
+    if [ "$kind" = "h3" ] && [ "${h3_port:-0}" != "0" ]; then
+        _warn "H3 已在运行（$(_port_desc "$h3_port" "$h3_public")），重新部署会更换端口。"
+    fi
+
+    read -r -p "  ${label} 端口 [回车随机]: " input || input=""
+    if ! spec=$(_parse_port_spec "$input"); then
+        _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
+        spec=$(_parse_port_spec "")
+    fi
+    listen="${spec%% *}"; pub="${spec##* }"
+
+    if [ "$kind" = "reality" ]; then
+        reality_port="$listen"; reality_public="$pub"
+        [ "${h3_port:-0}" != "0" ] && _info "保留现有 H3: $(_port_desc "$h3_port" "$h3_public")"
+    else
+        h3_port="$listen"; h3_public="$pub"
+        [ "${reality_port:-0}" != "0" ] && _info "保留现有 Reality: $(_port_desc "$reality_port" "$reality_public")"
+    fi
+
+    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
+        "$argo_domain" "$argo_token" "$tid" "$zid" "$reality_public" "$h3_public"
+}
+
+# 删除单个直连协议（reality | h3）
+_remove_protocol() {
+    local kind="$1" label tmp remain
+    case "$kind" in
+        reality) label="Reality Vision" ;;
+        h3)      label="H3 直连" ;;
+        *)       _error "未知协议: ${kind}"; return 1 ;;
+    esac
+
+    if ! _ask_yes "  确认删除 ${label}? (y/N): " n; then
+        _info "已取消。"
+        return 0
+    fi
+
+    tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
+    if [ "$kind" = "reality" ]; then
+        if ! jq '.reality_port = 0 | .reality_public_port = 0
+                 | .reality_private_key = "" | .reality_public_key = "" | .reality_short_id = ""' \
+                "$META_FILE" > "$tmp"; then
+            rm -f "$tmp"
+            _error "更新 meta.json 失败。"
+            return 1
+        fi
+    else
+        if ! jq '.h3_port = 0 | .h3_public_port = 0 | .h3_path = ""' "$META_FILE" > "$tmp"; then
+            rm -f "$tmp"
+            _error "更新 meta.json 失败。"
+            return 1
+        fi
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
+
+    remain=$(jq -r '[(.reality_port // 0), (.h3_port // 0),
+                     (if ((.argo_token // "") != "") then 1 else 0 end)]
+                    | map(select(. > 0)) | length' "$META_FILE" 2>/dev/null)
+    if [ "${remain:-0}" -gt 0 ]; then
+        _write_config || return 1
+        _check_config || return 1
+        _manage_service restart || _warn "Xray 重启失败，请手动检查。"
+        _success "${label} 已删除。"
+        _show_links
+    else
+        _warn "所有节点已删除，正在停止 Xray 服务..."
+        _manage_service stop >/dev/null 2>&1 || true
+        _success "已清空所有节点（配置文件仍保留在 ${XRAY_DIR}）"
+    fi
+    return 0
+}
+
+# 删除节点子菜单：Reality / H3 / Argo
+_delete_node_menu() {
+    _check_root
+    _detect_init_system
+
+    if [ ! -s "$META_FILE" ]; then
+        _error "尚未部署，没有可删除的节点。"
+        return 1
+    fi
+
+    while true; do
+        local rp rpub hp hpub ap adom choice
+        IFS=$'\x1f' read -r rp rpub hp hpub ap adom < <(
+            jq -r '[((.reality_port // 0) | tostring),
+                    ((.reality_public_port // .reality_port // 0) | tostring),
+                    ((.h3_port // 0) | tostring),
+                    ((.h3_public_port // .h3_port // 0) | tostring),
+                    ((.argo_port // 0) | tostring),
+                    (.argo_domain // "")]
+                   | join("\u001f")' "$META_FILE" 2>/dev/null
+        )
+
+        echo "" >&2
+        echo -e "${CYAN}  === 删除节点 ===${NC}" >&2
+        if [ "${rp:-0}" != "0" ]; then
+            echo -e "    ${RED}[1]${NC} Reality Vision   $(_port_desc "$rp" "$rpub")" >&2
+        else
+            echo -e "    ${YELLOW}[1]${NC} Reality Vision   未部署${NC}" >&2
+        fi
+        if [ "${hp:-0}" != "0" ]; then
+            echo -e "    ${RED}[2]${NC} H3 直连          $(_port_desc "$hp" "$hpub")" >&2
+        else
+            echo -e "    ${YELLOW}[2]${NC} H3 直连          未部署${NC}" >&2
+        fi
+        if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
+            echo -e "    ${RED}[3]${NC} Argo 隧道        ${adom}" >&2
+            echo -e "        ${YELLOW}(含云端隧道 + DNS 解析)${NC}" >&2
+        else
+            echo -e "    ${YELLOW}[3]${NC} Argo 隧道        未部署${NC}" >&2
+        fi
+        echo -e "    ${GREEN}[0]${NC} 返回" >&2
+        echo "" >&2
+
+        read -r -p "  请选择 [0-3]: " choice || return 0
+        case "$choice" in
+            1)
+                [ "${rp:-0}" = "0" ] && { _warn "Reality 未部署。"; continue; }
+                _remove_protocol reality
+                ;;
+            2)
+                [ "${hp:-0}" = "0" ] && { _warn "H3 未部署。"; continue; }
+                _remove_protocol h3
+                ;;
+            3)
+                if [ "${ap:-0}" = "0" ] || [ -z "${adom:-}" ]; then
+                    _warn "Argo 未部署。"
+                    continue
+                fi
+                _argo_delete_node
+                ;;
+            0 | "") return 0 ;;
+            *) _error "无效输入。" ;;
+        esac
+    done
+}
+
 # ==============================================================================
 #  维护
 # ==============================================================================
@@ -2300,12 +2479,12 @@ _main_menu() {
         _show_status
 
         echo -e "  ${CYAN}【部署】${NC}" >&2
-        echo -e "    ${GREEN}[1]${NC} 一键部署 (Reality + H3，端口可选)" >&2
-        echo -e "    ${GREEN}[2]${NC} 自定义部署 (可选协议/端口/Argo)" >&2
-        echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (可单独创建，无需先装直连)" >&2
+        echo -e "    ${GREEN}[1]${NC} 部署 Reality Vision (端口可选)" >&2
+        echo -e "    ${GREEN}[2]${NC} 部署 H3 直连 (端口可选)" >&2
+        echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (CF 邮箱 + API Key)" >&2
         echo "" >&2
         echo -e "  ${CYAN}【节点】${NC}" >&2
-        echo -e "    ${RED}[4]${NC} 删除 Argo 节点 (含云端隧道 + DNS)" >&2
+        echo -e "    ${RED}[4]${NC} 删除节点 (Reality / H3 / Argo)" >&2
         echo "" >&2
         echo -e "  ${CYAN}【管理】${NC}" >&2
         echo -e "    ${GREEN}[5]${NC} 查看节点链接" >&2
@@ -2326,10 +2505,10 @@ _main_menu() {
         local choice=""
         read -r -p "  请输入选项 [0-12]: " choice || return 0
         case "$choice" in
-            1) _one_click_deploy ;;
-            2) _custom_deploy ;;
+            1) _deploy_single_proto reality ;;
+            2) _deploy_single_proto h3 ;;
             3) _add_argo_only ;;
-            4) _argo_delete_node ;;
+            4) _delete_node_menu ;;
             5) _show_links ;;
             6) _service_menu ;;
             7) _view_log ;;
@@ -2364,12 +2543,18 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     5              卸载部署
     0              退出
 
+  注：以上是命令行快捷指令。进入菜单后是另一套编号：
+    [1] 部署 Reality   [2] 部署 H3   [3] Argo 自动搭建   [4] 删除节点
+
   完整命令：
     menu              进入管理菜单
-    deploy            一键部署 Reality + H3（随机端口）
-    custom            自定义部署（可选协议/端口/Argo）
+    deploy            同时部署 Reality + H3（随机端口）
+    reality           只部署 / 重部署 Reality（端口可选）
+    h3                只部署 / 重部署 H3（端口可选）
+    custom            自定义部署（一次选多个协议）
     argo              Argo 自动搭建（CF 邮箱 + Global API Key；无部署时创建仅 Argo 节点）
-    del-argo          删除 Argo 节点（含云端隧道 + DNS 解析）
+    del-node          删除节点（Reality / H3 / Argo 任选）
+    del-argo          直接删除 Argo 节点（含云端隧道 + DNS 解析）
     links             查看节点链接与 Base64 订阅
     status            查看运行状态
     start|stop|restart 控制 Xray 服务
@@ -2434,6 +2619,17 @@ main() {
         deploy | install | onekey)
             _install_dependencies || exit 1
             _one_click_deploy
+            ;;
+        reality | reality-only)
+            _install_dependencies || exit 1
+            _deploy_single_proto reality
+            ;;
+        h3 | h3-only)
+            _install_dependencies || exit 1
+            _deploy_single_proto h3
+            ;;
+        del-node | delete-node | rm-node)
+            _delete_node_menu
             ;;
         custom)
             _install_dependencies || exit 1
