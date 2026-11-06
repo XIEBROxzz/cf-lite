@@ -1037,7 +1037,20 @@ do_uninstall_script() {
     state=$(load_state 2>/dev/null || true)
 
     echo
-    read -rp "$(printf '\033[31m确定卸载脚本? 将自动删除已部署节点并自删脚本文件 (y/N): \033[0m')" confirm
+    echo "即将删除以下内容："
+    [[ -n "$state" ]] && echo "  - 已部署节点（云端 DNS 记录 / Origin Rules / Origin 证书）"
+    echo "  - Xray 内核: ${XRAY_BINARY}"
+    echo "  - Xray 配置目录: ${XRAY_CONFIG_DIR}"
+    if svc_is_foreign; then
+        echo "  - 注意: xray 服务由其他脚本托管（如 CF-C/xg），不会停止也不会删除"
+    else
+        echo "  - xray 服务与 unit（含 xray.service.d 里的 drop-in）"
+    fi
+    echo "  - 状态目录: ${STATE_DIR}"
+    echo "  - 快捷命令: /usr/local/bin/x"
+    echo "  - 本脚本自身"
+    echo
+    read -rp "$(printf '\033[31m确定卸载以上全部内容? (y/N): \033[0m')" confirm
     [[ "${confirm,,}" =~ ^y(es)?$ ]] || { info "已取消"; return 0; }
 
     if [[ -n "$state" ]]; then
@@ -1049,6 +1062,27 @@ do_uninstall_script() {
         info "未检测到已部署节点，仅停止服务并清理"
         stop_xray
     fi
+
+    # 内核与 unit：以前只删状态目录，内核 / 配置 / unit 全留在机器上，
+    # 结果卸载完 xray 还占着 xray.service，CF-C 装上后启的是这个空壳 → 秒退重启。
+    if ! svc_is_foreign; then
+        if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+            systemctl stop xray &>/dev/null || true
+            systemctl disable xray &>/dev/null || true
+            rm -f /etc/systemd/system/xray.service
+            rm -rf /etc/systemd/system/xray.service.d
+            systemctl daemon-reload &>/dev/null || true
+            systemctl reset-failed xray &>/dev/null || true
+        else
+            rc-service xray stop &>/dev/null || true
+            rc-update del xray default &>/dev/null || true
+            rm -f /etc/init.d/xray
+        fi
+    fi
+    rm -f "$XRAY_BINARY"
+    rm -rf "$XRAY_CONFIG_DIR"
+    [[ -d /var/log/xray ]] && rm -rf /var/log/xray
+    ok "Xray 内核、配置与 unit 已清理"
 
     rm -rf "$STATE_DIR"
     rm -f /usr/local/bin/x
