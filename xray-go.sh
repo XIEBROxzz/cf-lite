@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.1"
+export SCRIPT_VERSION="2.2"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -767,9 +767,16 @@ _service_is_running() {
     esac
 }
 
+# 到 Cloudflare 边缘建几条长连接（--ha-connections）
+# CF 期望一个 connector 建 4 条、落在至少 2 个机房，少于此数面板会把隧道标成「降级」。
+# 以前 quic 只给 1 条 → 面板一直显示降级；quic 同样支持多条，统一给 4。
 _argo_connections() {
     local proto="${1,,}"
-    if [ "$proto" = "http2" ]; then echo "4"; else echo "1"; fi
+    case "$proto" in
+        http2) echo "4" ;;
+        quic)  echo "4" ;;
+        *)     echo "4" ;;
+    esac
 }
 
 _write_argo_service() {
