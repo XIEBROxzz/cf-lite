@@ -1271,6 +1271,7 @@ _apply_firewall() {
     local p
     for p in "$@"; do
         [[ "$p" =~ ^[0-9]+$ ]] || continue
+        [ "$p" = "0" ] && continue
         if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
             ufw allow "$p"/tcp >/dev/null 2>&1 || true
             ufw allow "$p"/udp >/dev/null 2>&1 || true
@@ -1524,8 +1525,11 @@ _deploy_all() {
 
     echo "" >&2
     echo -e "${GREEN}──────────── 部署完成 ────────────${NC}" >&2
-    echo -e "  Reality 端口 : ${reality_port}" >&2
-    echo -e "  H3 端口      : ${h3_port}" >&2
+    local reality_show h3_show
+    if [ "$reality_port" = "0" ]; then reality_show="未启用"; else reality_show="$reality_port"; fi
+    if [ "$h3_port" = "0" ]; then h3_show="未启用"; else h3_show="$h3_port"; fi
+    echo -e "  Reality 端口 : ${reality_show}" >&2
+    echo -e "  H3 端口      : ${h3_show}" >&2
     echo -e "  Argo 端口    : ${argo_port}  (${argo_protocol})" >&2
     echo -e "  服务模式     : ${INIT_SYSTEM}" >&2
 
@@ -1707,9 +1711,22 @@ _add_argo_only() {
     _check_root
     _detect_init_system
 
+    # 没有任何部署：直接创建「仅 Argo」节点（不生成 Reality / H3 直连）
     if [ ! -s "$META_FILE" ]; then
-        _error "尚未部署基础协议，请先执行 [1] 一键部署。"
-        return 1
+        echo "" >&2
+        echo -e "${CYAN}  未检测到现有部署，将创建「仅 Argo」节点。${NC}" >&2
+        echo -e "  只生成 H2-Argo / H3-Argo 两条隧道节点，不占公网端口、不需要公网 IP。" >&2
+        echo -e "  如需同时保留直连节点，请改用 ${GREEN}[1] 一键部署${NC} 并在过程中选择搭建 Argo。" >&2
+        echo "" >&2
+        if ! _ask_yes "  确认创建仅 Argo 部署? (y/N): " n; then
+            _info "已取消。"
+            return 0
+        fi
+        _install_dependencies || return 1
+        _argo_auto_setup || return 1
+        _deploy_all 0 0 "$ARGO_PROTOCOL" "$ARGO_PORT" "$ARGO_DOMAIN" "$ARGO_TOKEN" \
+            "$ARGO_TUNNEL_ID" "$ARGO_ZONE_ID"
+        return $?
     fi
 
     _install_dependencies || return 1
@@ -2204,7 +2221,7 @@ _main_menu() {
         echo -e "  ${CYAN}【部署】${NC}" >&2
         echo -e "    ${GREEN}[1]${NC} 一键部署 (Reality + H3，随机端口)" >&2
         echo -e "    ${GREEN}[2]${NC} 自定义部署 (可选协议/端口/Argo)" >&2
-        echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (CF 邮箱 + API Key)" >&2
+        echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (可单独创建，无需先装直连)" >&2
         echo "" >&2
         echo -e "  ${CYAN}【节点】${NC}" >&2
         echo -e "    ${RED}[4]${NC} 删除 Argo 节点 (含云端隧道 + DNS)" >&2
@@ -2270,7 +2287,7 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     menu              进入管理菜单
     deploy            一键部署 Reality + H3（随机端口）
     custom            自定义部署（可选协议/端口/Argo）
-    argo              Argo 自动搭建（CF 邮箱 + Global API Key）
+    argo              Argo 自动搭建（CF 邮箱 + Global API Key；无部署时创建仅 Argo 节点）
     del-argo          删除 Argo 节点（含云端隧道 + DNS 解析）
     links             查看节点链接与 Base64 订阅
     status            查看运行状态

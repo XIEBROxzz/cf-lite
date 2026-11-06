@@ -97,6 +97,7 @@ xg           # 菜单标题栏直接显示 V1.0
 - **VLESS-TCP-REALITY Vision**：无需域名，伪装 TLS，免疫主动探测
 - **Argo 全自动搭建**：填 Cloudflare 邮箱 + Global API Key，脚本自动建隧道、写 ingress、建 DNS CNAME、取 Token、启动 cloudflared
   - 隧道名取域名首段：`xnsd.xxxx.com` → 隧道 `xnsd`；同名隧道自动复用，不会重复创建
+  - **可以只装 Argo**：服务器上还没有任何部署时直接跑 `xg argo`（或菜单 `[3]`），创建「仅 Argo」节点——只生成 H2-Argo / H3-Argo 两条隧道节点，不开公网端口、不需要公网 IP
   - 删除节点（`[4]` / `xg del-argo`）会一并删除云端隧道 + DNS 解析
   - 卸载（`xg 5` / `uninstall.sh`）会一并删除云端隧道 + DNS 解析 + 本地全部文件
 - 自动装依赖 → 装核心（SHA-256 校验）→ 生成配置 → 托管服务（systemd / openrc / direct）→ 放行端口 → 输出链接与 Base64 订阅
