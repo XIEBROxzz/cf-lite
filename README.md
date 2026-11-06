@@ -1,7 +1,7 @@
 
 ## 🗂️ 三套方案：CF-A / CF-B / CF-C
 
-**CF-A**  快捷键X CF CDN橙云
+**CF-A**  快捷键x CF CDN橙云
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_cf_lite.sh)
