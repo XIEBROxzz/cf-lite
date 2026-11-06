@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Debian-11%2B-A81D33?style=flat-square&logo=debian&logoColor=white" alt="Debian">
   <img src="https://img.shields.io/badge/CentOS-7%2F8%2F9-26252D?style=flat-square&logo=centos&logoColor=white" alt="CentOS">
   <img src="https://img.shields.io/badge/Alpine-Linux-0D5BE1?style=flat-square&logo=alpine&logoColor=white" alt="Alpine">
-  <img src="https://img.shields.io/badge/Xray--go-V1.2-2ea44f?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Xray--go-V1.3-2ea44f?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License">
 </p>
 
@@ -83,7 +83,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 
 ```
   ╔══════════════════════════════════════════╗
-  ║     Xray-go 一键部署管理脚本 V1.2        ║
+  ║     Xray-go 一键部署管理脚本 V1.3        ║
   ╚══════════════════════════════════════════╝
 ```
 
@@ -250,6 +250,60 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 > 手动模式下 Cloudflare 后台需把该隧道的 Public Hostname 指向 `http://127.0.0.1:8001`。
 > 协议选择建议：`http2` 默认 4 条连接，`quic` 默认 1 条连接，实测后择优。
 
+## 🔎 怎么确认 Argo 走的是 UDP（QUIC）
+
+Argo 链路有两跳，**两跳都走 UDP 才算全段 UDP**：
+
+```
+客户端 ──①──> Cloudflare 边缘 ──②──> cloudflared ──> 本机 Xray
+   ① 由链接决定：H3-Argo(alpn=h3) = UDP，H2-Argo(alpn=h2) = TCP
+   ② 由隧道 protocol 决定：quic = UDP，http2 = TCP
+```
+
+### 服务端这一跳（②）：`xg diag`
+
+菜单 `[9]` 或 `xg diag`，会多出一段：
+
+```
+════════ Argo 传输（UDP / QUIC）════════
+  配置协议 : quic   （cloudflared --protocol）
+  日志协议 : quic   （protocol=xxx）
+  边缘连接 : UDP 4 条 / TCP 0 条   （端口 7844）
+  实际传输 : QUIC（UDP）
+```
+
+判定依据（按优先级）：
+
+| 证据 | 说明 |
+| :--- | :--- |
+| 日志出现 `falling back` / `failed to dial to edge with quic` | 已回退，实际是 TCP |
+| `ss -aunp` 里有 cloudflared 的 UDP 7844 连接 | 走 QUIC |
+| 只有 `ss -atnp` 里的 TCP 7844 连接 | 走 HTTP/2 |
+| 都没有连接但日志写 `protocol=quic` | 按日志判断 |
+
+**关键坑**：`--protocol quic` 只是「请求用 QUIC」。如果这台机器到 Cloudflare 的 **UDP 7844 不通**，cloudflared 会**静默回退成 http2**——配置看着是 quic，实际跑的是 TCP。`xg diag` 里「配置 quic，但只有 TCP 连接」就是在报这个。
+
+### 手工核对（不用脚本也能查）
+
+```bash
+ps -ef | grep -o -- '--protocol [a-z0-9]*'          # 配置值
+ss -aunp | grep cloudflared                          # 有输出 = QUIC 在跑
+ss -atnp | grep cloudflared                          # 有输出 = HTTP/2 在跑
+journalctl -u xray-argo -n 100 | grep -E 'protocol=|falling back'
+tcpdump -ni any udp port 7844                        # 抓到包就是真 UDP
+```
+
+### 客户端这一跳（①）
+
+| 链接名 | 第一跳 | 说明 |
+| :--- | :--- | :--- |
+| `H3-Argo`（`alpn=h3`） | UDP | 想要全段 UDP 选这个 |
+| `H2-Argo`（`alpn=h2`） | TCP | 兼容性最好 |
+
+只有「隧道 `quic` + 客户端选 `H3-Argo`」才是端到端 UDP；隧道是 `http2` 时，客户端选 `H3-Argo` 也只有第一跳是 UDP。
+
+---
+
 ### 兼容旧版参数写法
 
 原有的复合参数仍然可用（`port"xxxx"` 的解析已修复）：
@@ -302,25 +356,25 @@ xg deploy | custom | links | status | start | stop | restart | log | check | dia
 
 ## 🏷️ 版本与更新
 
-当前版本：**V1.2**（构建 2026-11-06）
+当前版本：**V1.3**（构建 2026-11-06）
 
 想确认自己装的是哪一版、更新有没有成功，看这三处任一处即可：
 
 ```bash
-xg -v                 # 输出: Xray-go V1.2 (2026-11-06)
-xg status             # 状态页会显示「脚本版本 : V1.2 (2026-11-06)」
-xg                    # 菜单标题栏直接显示 V1.2
+xg -v                 # 输出: Xray-go V1.3 (2026-11-06)
+xg status             # 状态页会显示「脚本版本 : V1.3 (2026-11-06)」
+xg                    # 菜单标题栏直接显示 V1.3
 ```
 
 更新脚本时的反馈规则：
 
 | 情况 | 输出 |
 | :--- | :--- |
-| 远端版本更新 | `[成功] 脚本已更新: V1.1 -> V1.2` |
-| 远端版本相同 | `[成功] 当前已是最新版本 V1.2，无需更新。` |
-| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.2（版本号未变化）` |
+| 远端版本更新 | `[成功] 脚本已更新: V1.2 -> V1.3` |
+| 远端版本相同 | `[成功] 当前已是最新版本 V1.3，无需更新。` |
+| 需要强行覆盖重装 | `xg update-script force` → `脚本已覆盖重装: V1.3（版本号未变化）` |
 
-版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.2"`，改这里即可发新版。
+版本号写在 `xray-go.sh` 顶部：`export SCRIPT_VERSION="1.3"`，改这里即可发新版。
 
 ---
 

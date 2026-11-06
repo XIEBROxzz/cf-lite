@@ -14,7 +14,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="1.2"
+export SCRIPT_VERSION="1.3"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -682,6 +682,47 @@ _listen_check() {
     fi
 }
 
+# Argo 隧道实际传输：配置成 quic 不等于真的在跑 QUIC（UDP 不通会自动回退 http2）
+# 输出 5 段（\x1f 分隔）：状态 / 配置协议 / UDP 连接数 / TCP 连接数 / 日志里的协议
+# 状态取值：quic | http2 | fallback | unknown
+_argo_transport() {
+    local cfg="" proc_proto="" udp=0 tcp=0 log_proto="" logtext="" fallback=false state="unknown"
+
+    [ -s "$META_FILE" ] && cfg=$(jq -r '.argo_protocol // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
+
+    # 进程实际参数（配置里写的和真正跑起来的可能不一致）
+    proc_proto=$(ps -eo args= 2>/dev/null | grep -F "cloudflared" | grep -v grep \
+        | sed -n 's/.*--protocol[= ]\{1\}\([a-z0-9]*\).*/\1/p' | head -n1)
+
+    # 与 Cloudflare 边缘的连接：QUIC 是 UDP 套接字，http2 是 TCP 连接（端口都是 7844）
+    if command -v ss >/dev/null 2>&1; then
+        udp=$(ss -aunp 2>/dev/null | awk '(/cloudflared/ || /:7844/) {c++} END{print c+0}')
+        tcp=$(ss -atnp 2>/dev/null | awk '(/cloudflared/ || /:7844/) {c++} END{print c+0}')
+    fi
+    udp=${udp:-0}; tcp=${tcp:-0}
+
+    # 日志：direct 模式写文件，systemd 走 journald
+    if [ -s "$ARGO_LOG_FILE" ]; then
+        logtext=$(tail -n 300 "$ARGO_LOG_FILE" 2>/dev/null)
+    elif command -v journalctl >/dev/null 2>&1; then
+        logtext=$(journalctl -u xray-argo -n 300 --no-pager 2>/dev/null)
+    fi
+    log_proto=$(printf '%s' "$logtext" | grep -o 'protocol=[a-z0-9]*' | tail -n1 | cut -d= -f2)
+    printf '%s' "$logtext" | grep -qiE 'falling back|fallback|failed to dial to edge with quic|quic.*fail' && fallback=true
+
+    if [ "$fallback" = true ]; then
+        state="fallback"
+    elif [ "$udp" -gt 0 ] 2>/dev/null; then
+        state="quic"
+    elif [ "$tcp" -gt 0 ] 2>/dev/null; then
+        state="http2"
+    elif [ -n "$log_proto" ]; then
+        state="$log_proto"
+    fi
+
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s' "$state" "${cfg:-$proc_proto}" "$udp" "$tcp" "$log_proto"
+}
+
 # 连通性自检：环境 / 端口监听 / 防火墙 / 证书 / 日志 / 结论
 _diag() {
     _check_root
@@ -738,6 +779,22 @@ _diag() {
         echo -e "  Argo     : 127.0.0.1:${ap} → ${adom}" >&2
     else
         echo -e "  Argo     : 未部署" >&2
+    fi
+
+    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log=""
+    if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
+        IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log < <(_argo_transport)
+        echo "" >&2
+        echo -e "${CYAN}════════ Argo 传输（UDP / QUIC）════════${NC}" >&2
+        echo -e "  配置协议 : ${at_cfg:-未记录}   （cloudflared --protocol）" >&2
+        echo -e "  日志协议 : ${at_log:-未采集到}   （protocol=xxx）" >&2
+        echo -e "  边缘连接 : UDP ${at_udp:-0} 条 / TCP ${at_tcp:-0} 条   （端口 7844）" >&2
+        case "$at_state" in
+            quic)     echo -e "  实际传输 : ${GREEN}QUIC（UDP）${NC}" >&2 ;;
+            http2)    echo -e "  实际传输 : ${YELLOW}HTTP/2（TCP）${NC}" >&2 ;;
+            fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
+            *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（服务未运行或日志为空）" >&2 ;;
+        esac
     fi
 
     echo "" >&2
@@ -807,6 +864,30 @@ _diag() {
             echo -e "     处理：菜单 [2] 重部署 H3 时把 SNI 改成证书上的域名，或改用自签证书（链接带 allowInsecure=1）。" >&2
         fi
     fi
+    # Argo 这一跳是不是真的 UDP：配置 quic 但 UDP 不通时 cloudflared 会静默回退 http2
+    if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
+        case "$at_state" in
+            fallback)
+                issues=$((issues + 1))
+                _warn "Argo 隧道已从 QUIC 回退到 HTTP/2 —— 本机到 Cloudflare 的 UDP 7844 不通。" >&2
+                echo -e "     此时客户端用 H3-Argo 链接，第一跳是 UDP，但隧道这一跳已经是 TCP。" >&2
+                echo -e "     处理：换网络/换机器，或直接改用 H2-Argo 链接（更稳）。" >&2
+                ;;
+            http2)
+                if [ "$at_cfg" = "quic" ]; then
+                    issues=$((issues + 1))
+                    _warn "配置是 quic，但只有 TCP 连接 —— UDP 不通，已回退 HTTP/2。" >&2
+                else
+                    echo -e "  ${CYAN}Argo 隧道走 HTTP/2（TCP）${NC}：http2 模式的正常表现。" >&2
+                    echo -e "     想要全段 UDP：重部署 Argo 时选 quic，客户端再用 H3-Argo 链接。" >&2
+                fi
+                ;;
+            quic)
+                echo -e "  ${GREEN}Argo 隧道走 QUIC（UDP 7844）${NC}：客户端用 H3-Argo 链接即为全段 UDP。" >&2
+                ;;
+        esac
+    fi
+
     [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
 
     echo "" >&2
@@ -2486,6 +2567,18 @@ _show_status() {
         echo -e "  Argo     : ${RED}○ 未安装${NC}" >&2
     fi
 
+    # Argo 隧道实际传输（UDP/QUIC 还是 TCP/HTTP2）
+    if [ -s "$META_FILE" ] && [ "$(jq -r '.argo_port // 0' "$META_FILE" 2>/dev/null)" != "0" ]; then
+        local st
+        st=$(_argo_transport 2>/dev/null | cut -d$'\x1f' -f1)
+        case "$st" in
+            quic)     echo -e "  Argo 传输: ${GREEN}QUIC (UDP)${NC}" >&2 ;;
+            http2)    echo -e "  Argo 传输: ${YELLOW}HTTP/2 (TCP)${NC}" >&2 ;;
+            fallback) echo -e "  Argo 传输: ${RED}QUIC 已回退 HTTP/2${NC}" >&2 ;;
+            *)        echo -e "  Argo 传输: ${YELLOW}未知${NC}" >&2 ;;
+        esac
+    fi
+
     if [ -s "$META_FILE" ]; then
         echo -e "  端口     : $(jq -r '
             def fmt(l; pub): if ((pub // 0) == 0) or (pub == l) then "\(l)" else "\(l)→\(pub)" end;
@@ -2498,8 +2591,8 @@ _show_status() {
         local rs h3s
         rs=$(jq -r 'if (.reality_port // 0) > 0 then (.reality_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
         h3s=$(jq -r 'if (.h3_port // 0) > 0 then (.h3_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
-        [ -n "$rs" ] && echo -e "  Reality SNI: ${rs}" >&2
-        [ -n "$h3s" ] && echo -e "  H3 SNI   : ${h3s}" >&2
+        [ -n "$rs" ] && echo -e "  Reality SNI  : ${rs}" >&2
+        [ -n "$h3s" ] && echo -e "  H3 SNI       : ${h3s}" >&2
     else
         echo -e "  端口     : ${YELLOW}尚未部署${NC}" >&2
     fi
@@ -2879,7 +2972,7 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     start|stop|restart 控制 Xray 服务
     log               查看实时日志
     check             校验配置文件
-    diag              连通性自检（端口监听 / 防火墙 / 证书 / 日志 / 结论）
+    diag              连通性自检（端口监听 / Argo 传输 UDP 还是 TCP / 防火墙 / 证书 / 日志 / 结论）
     update-core       更新 Xray 核心
     update-script     更新本脚本（同版本自动跳过，加 force 强制覆盖）
     -v | --version    查看当前脚本版本号
