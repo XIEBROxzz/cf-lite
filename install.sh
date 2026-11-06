@@ -127,46 +127,23 @@ else
     _success "管理命令已安装: ${TARGET_BIN}"
 fi
 
-# 4. 带参数时直接执行
+# 4. 带参数时直接执行对应命令；无参数则直接进入管理菜单
 case "${1:-}" in
     deploy | -y | --yes | install | 2)
         _info "开始一键部署..."
         exec "$TARGET_BIN" deploy
         ;;
-    1 | 3 | 4 | 5)
+    "")
+        # 安装完直接进入主菜单，不再显示中间的 1-5 选择界面
+        if [ -t 0 ]; then
+            exec "$TARGET_BIN" menu
+        else
+            _info "非交互环境，可手动执行: xg（菜单）/ xg 2（一键部署）"
+        fi
+        ;;
+    *)
         exec "$TARGET_BIN" "$1"
         ;;
 esac
 
-echo "" >&2
-echo -e "  ${CYAN}快捷指令：${NC}" >&2
-echo -e "    ${GREEN}1${NC}) 进入管理菜单（推荐）" >&2
-echo -e "    ${GREEN}2${NC}) 一键部署 Reality + H3" >&2
-echo -e "    ${GREEN}3${NC}) 查看节点链接" >&2
-echo -e "    ${GREEN}4${NC}) 查看运行状态" >&2
-echo -e "    ${GREEN}5${NC}) 卸载部署" >&2
-echo -e "    ${YELLOW}0${NC}) 退出" >&2
-echo "" >&2
-echo -e "  ${CYAN}确认版本：${NC} xg -v     ${CYAN}升级脚本：${NC} xg update-script" >&2
-echo "" >&2
-
-if [ -t 0 ]; then
-    read -r -p "  请输入数字直接执行 [0-5]（回车进入菜单）: " answer || answer=""
-    case "$answer" in
-        1 | 2 | 3 | 4 | 5)
-            exec "$TARGET_BIN" "$answer"
-            ;;
-        "" )
-            exec "$TARGET_BIN" 1
-            ;;
-        0)
-            _info "已退出，可稍后执行: xg"
-            exit 0
-            ;;
-        *)
-            _warn "无效输入，可稍后执行: xg"
-            ;;
-    esac
-else
-    _info "非交互环境，可手动执行: xg 1（菜单）/ xg 2（一键部署）"
-fi
+exit 0

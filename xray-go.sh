@@ -2249,10 +2249,14 @@ _uninstall_deploy() {
 
     local cloud_tid="" cloud_zid="" cloud_domain="" cloud_token=""
     if [ -s "$META_FILE" ]; then
-        cloud_tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
-        cloud_zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
-        cloud_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
-        cloud_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
+        if command -v jq >/dev/null 2>&1; then
+            cloud_tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
+            cloud_zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
+            cloud_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
+            cloud_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
+        else
+            _warn "未安装 jq，读不到 Argo 隧道信息；云端隧道与 DNS 需手动在 Cloudflare 控制台删除。"
+        fi
     fi
 
     echo "" >&2
@@ -2284,20 +2288,26 @@ _uninstall_deploy() {
         _warn "未记录隧道 ID（手动 Token 部署），跳过云端清理，请手动在 Cloudflare 控制台删除隧道与 DNS。"
     fi
 
-    case "$INIT_SYSTEM" in
-        systemd)
-            systemctl disable --now xray >/dev/null 2>&1 || true
-            systemctl disable --now xray-argo >/dev/null 2>&1 || true
-            rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray-argo.service
-            systemctl daemon-reload >/dev/null 2>&1 || true
-            systemctl reset-failed xray xray-argo >/dev/null 2>&1 || true
-            ;;
-        openrc)
-            rc-update del xray default >/dev/null 2>&1 || true
-            rc-update del xray-argo default >/dev/null 2>&1 || true
-            rm -f /etc/init.d/xray /etc/init.d/xray-argo
-            ;;
-    esac
+    # 无条件清理所有托管痕迹：不依赖 INIT_SYSTEM 判定，避免容器/混合环境残留 unit
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now xray-argo >/dev/null 2>&1 || true
+        systemctl disable --now xray >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray-argo.service
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed xray xray-argo >/dev/null 2>&1 || true
+    fi
+
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service xray-argo stop >/dev/null 2>&1 || true
+        rc-service xray stop >/dev/null 2>&1 || true
+    fi
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del xray-argo default >/dev/null 2>&1 || true
+        rc-update del xray default >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/init.d/xray /etc/init.d/xray-argo
 
     _info "正在清理文件..."
     rm -rf "$XRAY_DIR" "$RUNTIME_DIR"
@@ -2496,7 +2506,7 @@ _main_menu() {
         echo -e "  ${CYAN}【维护】${NC}" >&2
         echo -e "    ${GREEN}[10]${NC} 更新 Xray 核心" >&2
         echo -e "    ${GREEN}[11]${NC} 更新脚本" >&2
-        echo -e "    ${RED}[12]${NC} 卸载部署" >&2
+        echo -e "    ${RED}[12]${NC} 卸载部署 (云端隧道 + DNS + 本地文件)" >&2
         echo "" >&2
         echo -e "  ───────────────────────────────────────────" >&2
         echo -e "    ${YELLOW}[0]${NC} 退出" >&2

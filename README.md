@@ -67,18 +67,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
 ```
 
-安装完直接显示数字菜单，输入数字即可执行：
+安装完**直接进入管理菜单**（不再有中间的 1-5 选择界面）：
 
 ```
-1) 进入管理菜单（推荐）
-2) 一键部署 Reality + H3
-3) 查看节点链接
-4) 查看运行状态
-5) 卸载部署
-0) 退出
+  ╔══════════════════════════════════════════╗
+  ║     Xray-go 一键部署管理脚本 V1.0        ║
+  ╚══════════════════════════════════════════╝
 ```
 
-也可以直接带数字：`xg 1` ~ `xg 5`。
+安装时也可带参数跳过菜单：`bash install.sh 2` 直接部署，`bash install.sh custom` 进自定义部署。
+
+日常命令行快捷指令：`xg 1` 菜单 / `xg 2` 部署 / `xg 3` 链接 / `xg 4` 状态 / `xg 5` 卸载。
 
 当前版本 **V1.0**（构建 2026-11-06），随时可确认装的是哪一版：
 
@@ -126,20 +125,22 @@ xg           # 菜单标题栏直接显示 V1.0
 | :--- | :--- |
 | A | 运行 `x` → 菜单内卸载 |
 | B | 运行 `sb` → 菜单内卸载 |
-| C | **二选一**：`xg 5`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)` |
+| C | **三选一**：`xg 5`、进菜单选 `[12]`、或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)` |
 
-> 两种方式**等价，跑一条即可**，不是两条都要执行。
+> 三种方式**完全等价，跑一条即可**，不是都要执行。
 >
-> - `xg 5`：本机还留着 `xg` 命令时用，走菜单里的卸载项。
+> - `xg 5`：命令行快捷指令，本机还留着 `xg` 时最省事。
+> - 菜单 `[12] 卸载部署`：和 `uninstall.sh` 走同一套清理逻辑。
 > - `bash <(curl -Ls ...)`：不依赖本地命令，直接从仓库拉最新卸载脚本执行。适合 `xg` 已被删除、脚本文件损坏，或想确保用最新卸载逻辑的情况。
 
-**清理范围（两条路径完全一致）**
+**清理范围（三条路径完全一致）**
 
 1. 停止并移除服务：systemd unit（`xray.service` / `xray-argo.service`）、openrc 服务、direct 模式后台进程（按 pidfile 精确 kill）
 2. 删除 Cloudflare 云端隧道（`?cascade=true`）及对应 DNS 解析记录
-3. 删除 `/etc/xray`：配置、证书、私钥、`cloudflared`、CF 凭据
-4. 删除 `/run/xraygo`（pidfile）与 `/var/log/xray.log`、`/var/log/xray-argo.log`
-5. 最后询问是否一并删除 `/usr/local/bin/xg`
+3. 无条件清理 systemd / openrc 的 unit 文件（不依赖当前运行模式判定，容器等混合环境也不会残留）
+4. 删除 `/etc/xray`：配置、证书、私钥、`cloudflared`、CF 凭据
+5. 删除 `/run/xraygo`（pidfile）与 `/var/log/xray.log`、`/var/log/xray-argo.log`
+6. 最后询问是否一并删除 `/usr/local/bin/xg`
 
 **会保留的**：系统依赖（`curl` / `jq` / `openssl` / `unzip`）；`/usr/local/bin/xg` 默认保留，第 5 步选 `y` 才删。
 
