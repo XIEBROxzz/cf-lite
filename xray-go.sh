@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.4"
+export SCRIPT_VERSION="2.5"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -594,15 +594,34 @@ _argo_transport() {
 
     logtext=$(_collect_argo_logtext)
 
+    # 日志是累积的（每次重启都会再注册一批），只看「最近一次启动」之后的那批，
+    # 否则跨重启混在一起会把「以前用过 http2」误判成「现在在回退」。
+    local batch=""
+    if printf '%s' "$logtext" | grep -q 'Starting tunnel'; then
+        batch=$(printf '%s\n' "$logtext" | awk '/Starting tunnel/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}')
+    else
+        batch="$logtext"
+    fi
+    local mix_q=0 mix_h=0 mix_n=0
+    if [ -n "$batch" ]; then
+        mix_q=$(printf '%s\n' "$batch" | grep -c 'protocol=quic')
+        mix_h=$(printf '%s\n' "$batch" | grep -c 'protocol=http2')
+        mix_q=${mix_q:-0}; mix_h=${mix_h:-0}
+        mix_n=$((mix_q + mix_h))
+    fi
+
     # cloudflared 的注册日志形如：... protocol=quic；不同版本/日志源分隔符可能是 = 或 :
-    log_proto=$(printf '%s' "$logtext" | grep -oE 'protocol[=: ]+[a-z0-9]+' | tail -n1 | sed 's/.*[=: ]//')
-    [ -n "$log_proto" ] || log_proto=$(printf '%s' "$logtext" \
+    log_proto=$(printf '%s' "$batch" | grep -oE 'protocol[=: ]+[a-z0-9]+' | tail -n1 | sed 's/.*[=: ]//')
+    [ -n "$log_proto" ] || log_proto=$(printf '%s' "$batch" \
         | grep -oiE 'transport[=: ]+(quic|http2)|using (quic|http2)' | tail -n1 \
         | grep -oiE 'quic|http2')
-    printf '%s' "$logtext" | grep -qiE 'falling back|fallback|failed to dial to edge with quic|quic.*fail' && fallback=true
+    printf '%s' "$batch" | grep -qiE 'falling back|fallback|failed to dial to edge with quic|quic.*fail' && fallback=true
 
     if [ "$fallback" = true ]; then
         state="fallback"
+    elif [ "$mix_q" -gt 0 ] 2>/dev/null && [ "$mix_h" -gt 0 ] 2>/dev/null; then
+        # 同一批里既有 quic 又有 http2：UDP 7844 只通了一部分，个别连接回退了
+        state="mixed"
     elif [ "$udp" -gt 0 ] 2>/dev/null; then
         state="quic"
     elif [ "$tcp" -gt 0 ] 2>/dev/null; then
@@ -611,7 +630,8 @@ _argo_transport() {
         state="$log_proto"
     fi
 
-    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s' "$state" "${cfg:-$proc_proto}" "$udp" "$tcp" "$log_proto"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
+        "$state" "${cfg:-$proc_proto}" "$udp" "$tcp" "$log_proto" "${mix_q}:${mix_h}:${mix_n}"
 }
 
 _write_systemd_service() {
@@ -1741,16 +1761,25 @@ _diag() {
     echo -e "  隧道协议 : ${aproto:-未记录}" >&2
     echo -e "  本地监听 : 127.0.0.1:${ap}   TCP:$(_listen_check "${ap}" t)" >&2
 
-    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" xff=0 xff_cfg=0
-    IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log < <(_argo_transport)
+    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" at_mix="" xff=0 xff_cfg=0
+    IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log at_mix < <(_argo_transport)
     echo "" >&2
     echo -e "${CYAN}════════ Argo 传输（UDP / QUIC）════════${NC}" >&2
     echo -e "  配置协议 : ${at_cfg:-未记录}   （cloudflared --protocol）" >&2
     echo -e "  日志协议 : ${at_log:-未采集到}   （protocol=xxx）" >&2
     echo -e "  边缘连接 : UDP ${at_udp:-0} 条 / TCP ${at_tcp:-0} 条   （端口 7844）" >&2
+    # 最近一次启动注册了几条、各用什么协议（CF 期望 4 条）
+    if [ -n "${at_mix:-}" ]; then
+        local mq="${at_mix%%:*}" mrest="${at_mix#*:}" mh="${mrest%%:*}" mn="${mrest##*:}"
+        echo -e "  连接明细 : quic ${mq:-0} 条 / http2 ${mh:-0} 条（最近一次启动，共 ${mn:-0} 条）" >&2
+        if [ "${mn:-0}" -lt 4 ] 2>/dev/null; then
+            echo -e "     ${YELLOW}不足 4 条${NC}：CF 面板会把隧道标成「降级」，可稍等再查。" >&2
+        fi
+    fi
     case "$at_state" in
         quic)     echo -e "  实际传输 : ${GREEN}QUIC（UDP）${NC}" >&2 ;;
         http2)    echo -e "  实际传输 : ${YELLOW}HTTP/2（TCP）${NC}" >&2 ;;
+        mixed)    echo -e "  实际传输 : ${YELLOW}部分 QUIC、部分 HTTP/2${NC}（UDP 7844 只通了一部分）" >&2 ;;
         fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
         *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（连接计数与隧道日志都没取到）" >&2 ;;
     esac
@@ -1808,6 +1837,12 @@ _diag() {
             _warn "Argo 隧道已从 QUIC 回退到 HTTP/2 —— 本机到 Cloudflare 的 UDP 7844 不通。" >&2
             echo -e "     此时客户端用 H3-Argo 链接，第一跳是 UDP，但隧道这一跳已经是 TCP。" >&2
             echo -e "     处理：换网络/换机器，或直接改用 H2-Argo 链接（更稳）。" >&2
+            ;;
+        mixed)
+            issues=$((issues + 1))
+            _warn "隧道里同时有 QUIC 和 HTTP/2 连接 —— UDP 7844 只通了一部分（部分连接回退）。" >&2
+            echo -e "     常见原因：运营商/云厂商对 UDP 限速或丢包，或出口 NAT 会话数受限。" >&2
+            echo -e "     能用，但性能不稳定。想稳定就重部署选 ${CYAN}http2${NC}；想全 UDP 只能换网络/换机器。" >&2
             ;;
         http2)
             if [ "$at_cfg" = "quic" ]; then
