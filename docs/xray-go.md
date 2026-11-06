@@ -138,7 +138,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 **不用去 Cloudflare 后台手动建隧道**，脚本用你的邮箱 + Global API Key 全自动完成：
 
 1. 校验凭据并读取账号下的 Zone / Account ID
-2. 创建命名隧道（隧道名取域名首段，如 `a.example.com` → `a`）
+2. 创建命名隧道（**隧道名 = 域名首段**，如 `xnsd.xxxx.com` → `xnsd`；同名隧道已存在则复用，不会重复创建）
 3. 写入云端 ingress（`http://127.0.0.1:<端口>`）
 4. 自动创建 DNS CNAME → `<隧道ID>.cfargotunnel.com`（橙云代理）
 5. 取回隧道 Token 并启动 cloudflared
@@ -158,9 +158,13 @@ xg argo     # 直接执行
 | :--- | :--- |
 | Cloudflare 邮箱 | 账号登录邮箱 |
 | Global API Key | CF 后台 → 我的个人资料 → API 令牌 → 查看 Global API Key |
-| 隧道域名 | 如 `a.example.com`，域名必须已托管在同一账号下 |
+| 隧道域名 | 如 `xnsd.xxxx.com`，域名必须已托管在同一账号下 |
 
-凭据保存在 `/etc/xray/cf.json`（权限 600），下次自动复用。卸载时会自动删除云端隧道与 DNS 记录。
+凭据保存在 `/etc/xray/cf.json`（权限 600），下次自动复用。
+
+**删除 Argo 节点**（`[4]` 或 `xg del-argo`）：停止 cloudflared → 删除云端隧道（cascade）→ 删除对应 DNS 解析 → 清理 `argo.env` 与 meta 中的 Argo 字段 → 重建配置并重启 Xray。
+
+> 手动 Token 部署的节点没有记录隧道 ID，删除时会提示你去控制台手动清理。
 
 **手动模式（已有 Token）**
 
@@ -200,19 +204,20 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 | **[1] 一键部署** | Reality + H3，随机端口，全自动 |
 | **[2] 自定义部署** | 可选协议 / 端口 / Argo（自动或手动） |
 | **[3] Argo 自动搭建** | 已部署后补充/重建 Argo 隧道（CF 邮箱 + API Key） |
-| **[4] 查看节点链接** | 重新输出链接与 Base64 订阅 |
-| **[5] 服务控制** | 启动 / 停止 / 重启 / 重启 Argo / 状态 |
-| **[6] [7] 日志** | Xray 日志、Argo 日志实时查看 |
-| **[8] 检查配置** | `xray -test` 校验 `config.json` |
-| **[9] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
-| **[10] 更新脚本** | 从仓库拉取最新管理脚本 |
-| **[11] 卸载部署** | 停服务、删配置、清日志、删云端隧道 |
+| **[4] 删除 Argo 节点** | 停隧道 + 删云端隧道 + 删 DNS 解析 + 清本地配置 |
+| **[5] 查看节点链接** | 重新输出链接与 Base64 订阅 |
+| **[6] 服务控制** | 启动 / 停止 / 重启 / 重启 Argo / 状态 |
+| **[7] [8] 日志** | Xray 日志、Argo 日志实时查看 |
+| **[9] 检查配置** | `xray -test` 校验 `config.json` |
+| **[10] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
+| **[11] 更新脚本** | 从仓库拉取最新管理脚本 |
+| **[12] 卸载部署** | 停服务、删云端隧道与 DNS、删本地全部文件 |
 
 命令行等价用法：
 
 ```bash
 xg 1..5                       # 数字快捷指令
-xg deploy | custom | argo | links | status | start | stop | restart | log | check | update-core | update-script | uninstall
+xg deploy | custom | argo | del-argo | links | status | start | stop | restart | log | check | update-core | update-script | uninstall
 ```
 
 ---
@@ -245,4 +250,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninsta
 xg 5
 ```
 
-卸载会停止并移除服务、删除 `/etc/xray`、`/run/xraygo` 与日志；若 Argo 是自动搭建的，还会一并删除 Cloudflare 云端隧道与 DNS 记录。管理命令 `xg` 会保留（如需删除：`rm -f /usr/local/bin/xg`）。
+卸载会依次执行：
+
+1. 停止并移除 Xray / Argo 服务（systemd / openrc / direct 进程）
+2. **删除 Cloudflare 云端隧道**（`cascade=true`）**与对应的 DNS 解析记录**
+3. 删除 `/etc/xray`（配置、证书、密钥、cloudflared、`cf.json`、`argo.env`）、`/run/xraygo` 与日志
+
+管理命令 `xg` 会保留（如需删除：`rm -f /usr/local/bin/xg`）。

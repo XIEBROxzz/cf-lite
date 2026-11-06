@@ -85,9 +85,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 - **XHTTP H3 直连**：HTTP/3 标准 UDP 传输，低延迟高吞吐，不易被运营商 QoS
 - **XHTTP-Argo 双模隧道**：隧道跑 quic 时全段 UDP，隐藏真实 IP、零端口暴露
 - **VLESS-TCP-REALITY Vision**：无需域名，伪装 TLS，免疫主动探测
-- **Argo 全自动搭建**：填 Cloudflare 邮箱 + Global API Key，脚本自动建隧道、写 ingress、建 DNS CNAME、取 Token、启动 cloudflared，卸载时自动删云端资源
+- **Argo 全自动搭建**：填 Cloudflare 邮箱 + Global API Key，脚本自动建隧道、写 ingress、建 DNS CNAME、取 Token、启动 cloudflared
+  - 隧道名取域名首段：`xnsd.xxxx.com` → 隧道 `xnsd`；同名隧道自动复用，不会重复创建
+  - 删除节点（`[4]` / `xg del-argo`）会一并删除云端隧道 + DNS 解析
+  - 卸载（`xg 5` / `uninstall.sh`）会一并删除云端隧道 + DNS 解析 + 本地全部文件
 - 自动装依赖 → 装核心（SHA-256 校验）→ 生成配置 → 托管服务（systemd / openrc / direct）→ 放行端口 → 输出链接与 Base64 订阅
-- 菜单化管理：查看链接、服务控制、日志、配置校验、更新核心、卸载
+- 菜单化管理：查看链接、服务控制、日志、配置校验、更新核心、删除节点、卸载
 
 详细说明见 **[docs/xray-go.md](docs/xray-go.md)**。
 
@@ -99,4 +102,4 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 | :--- | :--- |
 | A | 运行 `x` → 菜单内卸载 |
 | B | 运行 `sb` → 菜单内卸载 |
-| C | `xg 5`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)` |
+| C | `xg 5`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)`（含云端隧道 + DNS + 本地文件） |

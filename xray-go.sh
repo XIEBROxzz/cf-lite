@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 # 配置、元数据、私钥仅 root 可读写
 umask 077
 
-export SCRIPT_VERSION="2.1.0"
+export SCRIPT_VERSION="2.2.0"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
 # Github Cloudflare 安全代理（优先直连官方，失败后轮询代理）
@@ -1079,9 +1079,33 @@ _argo_tunnel_name() {
     printf '%s' "$name"
 }
 
-# 创建命名隧道 -> "tunnel_id token"
+# 按名称查找未删除的同名隧道 -> tunnel_id（找不到返回空）
+_cf_find_tunnel_by_name() {
+    local name="$1"
+    _cf_call GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?name=${name}&is_deleted=false&per_page=50" 2>/dev/null \
+        | jq -r --arg n "$name" '
+            [.result[]? | select(.name == $n and (.deleted_at // null) == null)][0].id // ""
+        ' 2>/dev/null
+}
+
+# 创建命名隧道 -> "tunnel_id token"（同名隧道已存在则复用，避免重复部署堆积）
 _cf_create_tunnel() {
-    local name="$1" resp tid token
+    local name="$1" resp tid token existing
+    existing=$(_cf_find_tunnel_by_name "$name")
+
+    if [ -n "$existing" ]; then
+        _info "检测到同名隧道 ${name} (${existing})，复用该隧道。"
+        tid="$existing"
+        token=$(_cf_call GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tid}/token" 2>/dev/null \
+            | jq -r '.result // ""' 2>/dev/null)
+        if [ -z "$token" ]; then
+            _error "复用隧道失败：无法获取 ${tid} 的 Token。"
+            return 1
+        fi
+        printf '%s %s\n' "$tid" "$token"
+        return 0
+    fi
+
     resp=$(_cf_call POST "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
         "$(jq -n --arg n "$name" '{name: $n, config_src: "cloudflare"}')") || return 1
     tid=$(printf '%s' "$resp" | jq -r '.result.id // ""' 2>/dev/null)
@@ -1719,6 +1743,105 @@ _add_argo_only() {
     return 0
 }
 
+# 删除 Argo 节点：停服务 -> 删云端隧道与 DNS -> 清 meta/本地文件 -> 重建配置并重启
+_argo_delete_node() {
+    _check_root
+    _detect_init_system
+
+    if [ ! -s "$META_FILE" ]; then
+        _error "尚未部署，没有可删除的 Argo 节点。"
+        return 1
+    fi
+
+    local token domain tid zid tname remain
+    token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
+    domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
+    tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
+    zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
+
+    if [ -z "$token" ] && [ -z "$tid" ]; then
+        _warn "当前没有 Argo 节点可删除。"
+        return 0
+    fi
+
+    tname=$(_argo_tunnel_name "$domain")
+
+    echo "" >&2
+    echo -e "${RED}  即将删除 Argo 节点：${NC}" >&2
+    echo -e "    域名      : ${domain:-未知}" >&2
+    echo -e "    隧道名称  : ${tname}" >&2
+    echo -e "    隧道 ID   : ${tid:-未知（手动 Token 部署）}" >&2
+    echo -e "    - 停止 cloudflared，移除 Argo 服务与本地配置" >&2
+    if [ -n "$tid" ]; then
+        echo -e "    - ${YELLOW}删除 Cloudflare 云端隧道 ${tid} 及其 DNS 解析${NC}" >&2
+    else
+        echo -e "    - ${YELLOW}未记录隧道 ID，云端资源需手动删除${NC}" >&2
+    fi
+    echo "" >&2
+
+    if ! _ask_yes "  确认删除该 Argo 节点? (y/N): " n; then
+        _info "已取消。"
+        return 0
+    fi
+
+    # 1. 停止并移除 Argo 服务
+    _info "正在停止 Argo 隧道..."
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl disable --now xray-argo >/dev/null 2>&1 || true
+            rm -f "$ARGO_SERVICE_FILE"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl reset-failed xray-argo >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            rc-service xray-argo stop >/dev/null 2>&1 || true
+            rc-update del xray-argo default >/dev/null 2>&1 || true
+            rm -f "$ARGO_SERVICE_FILE"
+            ;;
+        direct)
+            _direct_stop "$ARGO_PID_FILE" "$CLOUDFLARED_BIN"
+            ;;
+    esac
+
+    # 2. 删除云端隧道与 DNS（必须在删除凭据文件之前）
+    if [ -n "$tid" ]; then
+        _argo_auto_cleanup "$tid" "$zid" "$domain"
+    else
+        _warn "该节点为手动 Token 部署，未记录隧道 ID，请在 Cloudflare 控制台手动删除隧道与 DNS。"
+    fi
+
+    # 3. 清理本地 Argo 配置
+    rm -f "$ARGO_ENV_FILE"
+    local tmp
+    tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
+    if ! jq 'del(.argo_token, .argo_tunnel_id, .argo_zone_id)
+             | .argo_domain = ""
+             | .argo_port = 0
+             | .argo_protocol = ""' "$META_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        _error "更新 meta.json 失败。"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
+
+    # 4. 重建配置并重启（若已无其他协议则跳过）
+    remain=$(jq -r '[(.reality_port // 0), (.h3_port // 0)] | map(select(. > 0)) | length' "$META_FILE" 2>/dev/null)
+    if [ "${remain:-0}" -gt 0 ]; then
+        _write_config || return 1
+        _check_config || return 1
+        _manage_service restart || _warn "Xray 重启失败，请手动检查。"
+    else
+        _warn "已无其他协议在运行，建议直接执行 [卸载部署]。"
+    fi
+
+    _success "Argo 节点已删除：云端隧道、DNS 解析、本地配置均已清理。"
+    if [ "${remain:-0}" -gt 0 ]; then
+        _show_links
+    fi
+    return 0
+}
+
 # ==============================================================================
 #  维护
 # ==============================================================================
@@ -1839,11 +1962,12 @@ _uninstall_deploy() {
     _check_root
     _detect_init_system
 
-    local cloud_tid="" cloud_zid="" cloud_domain=""
+    local cloud_tid="" cloud_zid="" cloud_domain="" cloud_token=""
     if [ -s "$META_FILE" ]; then
         cloud_tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
         cloud_zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
         cloud_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
+        cloud_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
     fi
 
     echo "" >&2
@@ -1853,7 +1977,10 @@ _uninstall_deploy() {
     echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
     echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
     if [ -n "$cloud_tid" ]; then
-        echo -e "    - ${YELLOW}Cloudflare 云端隧道 ${cloud_tid} 及其 DNS 记录${NC}" >&2
+        echo -e "    - ${YELLOW}Cloudflare 云端隧道 ${cloud_tid}${NC}" >&2
+        [ -n "$cloud_domain" ] && echo -e "    - ${YELLOW}DNS 解析记录 ${cloud_domain}${NC}" >&2
+    elif [ -n "$cloud_token" ]; then
+        echo -e "    - ${YELLOW}注意：该 Argo 为手动 Token 部署，云端隧道需手动删除${NC}" >&2
     fi
     echo "" >&2
 
@@ -1868,6 +1995,8 @@ _uninstall_deploy() {
     # 先清理云端（需要在删除凭据文件之前完成）
     if [ -n "$cloud_tid" ]; then
         _argo_auto_cleanup "$cloud_tid" "$cloud_zid" "$cloud_domain"
+    elif [ -n "$cloud_token" ]; then
+        _warn "未记录隧道 ID（手动 Token 部署），跳过云端清理，请手动在 Cloudflare 控制台删除隧道与 DNS。"
     fi
 
     case "$INIT_SYSTEM" in
@@ -2038,36 +2167,40 @@ _main_menu() {
         echo -e "    ${GREEN}[2]${NC} 自定义部署 (可选协议/端口/Argo)" >&2
         echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (CF 邮箱 + API Key)" >&2
         echo "" >&2
+        echo -e "  ${CYAN}【节点】${NC}" >&2
+        echo -e "    ${RED}[4]${NC} 删除 Argo 节点 (含云端隧道 + DNS)" >&2
+        echo "" >&2
         echo -e "  ${CYAN}【管理】${NC}" >&2
-        echo -e "    ${GREEN}[4]${NC} 查看节点链接" >&2
-        echo -e "    ${GREEN}[5]${NC} 服务控制" >&2
-        echo -e "    ${GREEN}[6]${NC} 查看实时日志" >&2
-        echo -e "    ${GREEN}[7]${NC} 查看 Argo 日志" >&2
-        echo -e "    ${GREEN}[8]${NC} 检查配置文件" >&2
+        echo -e "    ${GREEN}[5]${NC} 查看节点链接" >&2
+        echo -e "    ${GREEN}[6]${NC} 服务控制" >&2
+        echo -e "    ${GREEN}[7]${NC} 查看实时日志" >&2
+        echo -e "    ${GREEN}[8]${NC} 查看 Argo 日志" >&2
+        echo -e "    ${GREEN}[9]${NC} 检查配置文件" >&2
         echo "" >&2
         echo -e "  ${CYAN}【维护】${NC}" >&2
-        echo -e "    ${GREEN}[9]${NC} 更新 Xray 核心" >&2
-        echo -e "    ${GREEN}[10]${NC} 更新脚本" >&2
-        echo -e "    ${RED}[11]${NC} 卸载部署" >&2
+        echo -e "    ${GREEN}[10]${NC} 更新 Xray 核心" >&2
+        echo -e "    ${GREEN}[11]${NC} 更新脚本" >&2
+        echo -e "    ${RED}[12]${NC} 卸载部署" >&2
         echo "" >&2
         echo -e "  ───────────────────────────────────────────" >&2
         echo -e "    ${YELLOW}[0]${NC} 退出" >&2
         echo "" >&2
 
         local choice=""
-        read -r -p "  请输入选项 [0-11]: " choice || return 0
+        read -r -p "  请输入选项 [0-12]: " choice || return 0
         case "$choice" in
             1) _one_click_deploy ;;
             2) _custom_deploy ;;
             3) _add_argo_only ;;
-            4) _show_links ;;
-            5) _service_menu ;;
-            6) _view_log ;;
-            7) _view_argo_log ;;
-            8) _check_config ;;
-            9) _update_core ;;
-            10) _update_script && exit 0 ;;
-            11) _uninstall_deploy ;;
+            4) _argo_delete_node ;;
+            5) _show_links ;;
+            6) _service_menu ;;
+            7) _view_log ;;
+            8) _view_argo_log ;;
+            9) _check_config ;;
+            10) _update_core ;;
+            11) _update_script && exit 0 ;;
+            12) _uninstall_deploy ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -2099,6 +2232,7 @@ Xray-go 管理脚本 v${SCRIPT_VERSION}
     deploy            一键部署 Reality + H3（随机端口）
     custom            自定义部署（可选协议/端口/Argo）
     argo              Argo 自动搭建（CF 邮箱 + Global API Key）
+    del-argo          删除 Argo 节点（含云端隧道 + DNS 解析）
     links             查看节点链接与 Base64 订阅
     status            查看运行状态
     start|stop|restart 控制 Xray 服务
@@ -2106,7 +2240,7 @@ Xray-go 管理脚本 v${SCRIPT_VERSION}
     check             校验配置文件
     update-core       更新 Xray 核心
     update-script     更新本脚本
-    uninstall         卸载部署
+    uninstall         卸载部署（含云端隧道 + DNS + 本地文件）
 
 兼容旧版参数写法（示例）:
   $(basename "$0") reality"n" h3"y" argo protocol"http2" port"8001" domain"" token""
@@ -2169,6 +2303,9 @@ main() {
             ;;
         argo | add-argo | argo-setup)
             _add_argo_only
+            ;;
+        del-argo | rm-argo | delete-argo)
+            _argo_delete_node
             ;;
         links | show)
             _install_dependencies >/dev/null 2>&1
