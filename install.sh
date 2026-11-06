@@ -55,6 +55,24 @@ _pkg_install() {
     fi
 }
 
+# cron 是否真的可用：Alpine 的 busybox 自带 crontab applet，
+# 命令存在但没有 crond 服务，任务写进去也不会执行
+_cron_ready() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    if command -v rc-service >/dev/null 2>&1; then
+        for s in dcron crond cronie cron; do
+            [ -x "/etc/init.d/$s" ] && return 0
+        done
+        return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl list-unit-files 2>/dev/null \
+            | grep -qE '^(cron|crond|cronie)\.service' && return 0
+        return 1
+    fi
+    return 0
+}
+
 _download() {
     local url="$1" out="$2" proxy
     if curl -fsSL --connect-timeout 8 --max-time 120 -o "$out" "$url" 2>/dev/null && [ -s "$out" ]; then
@@ -83,7 +101,7 @@ for cmd in curl bash; do
 done
 
 # cron 用于后续 Argo 保活巡检；装不上不阻塞安装（xg 会自动降级为守护服务）
-if ! command -v crontab >/dev/null 2>&1; then
+if ! _cron_ready; then
     _info "正在安装 cron（用于 Argo 保活巡检）..."
     if command -v apk >/dev/null 2>&1; then
         _pkg_install dcron >/dev/null 2>&1 || true
@@ -92,8 +110,8 @@ if ! command -v crontab >/dev/null 2>&1; then
     else
         _pkg_install cronie >/dev/null 2>&1 || true
     fi
-    command -v crontab >/dev/null 2>&1 \
-        || _warn "cron 未装上，保活将使用守护服务（不影响使用）"
+    _cron_ready \
+        || _warn "cron 未就绪，保活将使用守护服务（不影响使用）"
 fi
 if ! command -v curl >/dev/null 2>&1; then
     _error "缺少 curl，且自动安装失败，请手动安装后重试。"

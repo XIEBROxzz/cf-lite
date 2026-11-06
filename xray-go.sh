@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.15"
+export SCRIPT_VERSION="2.16"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -22,6 +22,8 @@ GITHUB_PROXY=('https://ess.ieshare.workers.dev/')
 
 # --- 路径与常量 ---
 XRAY_DIR="/etc/xray"
+# openrc 的 init 脚本目录（可被测试覆盖）
+INIT_D_DIR="${INIT_D_DIR:-/etc/init.d}"
 XRAY_BIN="${XRAY_DIR}/xray"
 CONFIG_FILE="${XRAY_DIR}/config.json"
 META_FILE="${XRAY_DIR}/meta.json"
@@ -159,7 +161,7 @@ _install_dependencies() {
 
     # cron 只用于 Argo 保活巡检，装不上不影响主功能（会自动降级为守护服务），
     # 所以这里不参与下面的「关键依赖失败」判定
-    if ! command -v crontab >/dev/null 2>&1; then
+    if ! _cron_ready; then
         local cron_pkg
         cron_pkg=$(_cron_pkg_name)
         if [ -n "$cron_pkg" ]; then
@@ -1381,17 +1383,40 @@ _keepalive_mode() {
 }
 
 # cron 命令在、服务也在跑才算可用（Alpine 是 dcron，Debian 是 cron）
+# cron 是否真的可用。光有 crontab 命令不够：
+# Alpine 的 busybox 自带 crontab applet，命令存在但**没有 crond 服务**，
+# 任务写进去也不会执行 —— 必须看 init 脚本 / systemd unit 在不在。
+_cron_ready() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    local s
+    case "$INIT_SYSTEM" in
+        openrc)
+            for s in dcron crond cronie cron; do
+                [ -x "${INIT_D_DIR}/$s" ] && return 0
+            done
+            return 1
+            ;;
+        systemd)
+            systemctl list-unit-files 2>/dev/null \
+                | grep -qE '^(cron|crond|cronie)\.service' && return 0
+            return 1
+            ;;
+        *)
+            command -v service >/dev/null 2>&1 || return 1
+            return 0
+            ;;
+    esac
+}
+
 _ensure_cron_service() {
-    local s started=false pkg="cron"
-    if ! command -v crontab >/dev/null 2>&1; then
-        command -v apk >/dev/null 2>&1 && pkg="dcron"
-        command -v apt-get >/dev/null 2>&1 && pkg="cron"
-        command -v dnf >/dev/null 2>&1 && pkg="cronie"
-        command -v yum >/dev/null 2>&1 && pkg="cronie"
+    local s started=false pkg
+    if ! _cron_ready; then
+        pkg=$(_cron_pkg_name)
+        [ -n "$pkg" ] || { _warn "无法确定 cron 包名，跳过。"; return 1; }
         _info "正在安装 cron 依赖: ${pkg} ..."
         _pkg_install "$pkg" >/dev/null 2>&1 || true
-        if ! command -v crontab >/dev/null 2>&1; then
-            _warn "crontab 命令仍不可用，cron 包没装上（检查软件源或手动执行: apk add dcron）"
+        if ! _cron_ready; then
+            _warn "cron 仍不可用（${pkg} 没装上，或缺少 ${INIT_D_DIR}/${pkg} 服务脚本）"
             return 1
         fi
     fi
