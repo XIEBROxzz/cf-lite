@@ -200,7 +200,8 @@ _rand_port() {
 # 无效返回 1
 _parse_port_spec() {
     local spec listen public p
-    spec=$(printf '%s' "${1:-}" | tr -d '[:space:]')
+    # 统一处理：去空白（含全角空格）、全角冒号转半角
+    spec=$(printf '%s' "${1:-}" | tr -d '[:space:]' | sed -e 's/：/:/g' -e 's/　//g')
 
     if [ -z "$spec" ]; then
         p=$(_pick_free_port)
@@ -1623,7 +1624,7 @@ _one_click_deploy() {
     local reality_port h3_port reality_public h3_public input spec
 
     if [ -t 0 ]; then
-        read -r -p "  Reality 端口 [回车随机]: " input || input=""
+        read -r -p "  Reality 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
         if ! spec=$(_parse_port_spec "$input"); then
             _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
             spec=$(_parse_port_spec "")
@@ -1631,7 +1632,7 @@ _one_click_deploy() {
         reality_port="${spec%% *}"; reality_public="${spec##* }"
 
         input=""
-        read -r -p "  H3 端口      [回车随机]: " input || input=""
+        read -r -p "  H3 端口      [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
         if ! spec=$(_parse_port_spec "$input"); then
             _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
             spec=$(_parse_port_spec "")
@@ -1710,7 +1711,7 @@ _custom_deploy() {
     local reality_port="0" h3_port="0" reality_public="0" h3_public="0" input="" spec
 
     if _ask_yes "  是否部署 VLESS-TCP-REALITY-Vision? (Y/n): " y; then
-        read -r -p "  Reality 端口 [回车随机]: " input || input=""
+        read -r -p "  Reality 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
         if ! spec=$(_parse_port_spec "$input"); then
             _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
             spec=$(_parse_port_spec "")
@@ -1721,7 +1722,7 @@ _custom_deploy() {
 
     input=""
     if _ask_yes "  是否部署 XHTTP-H3 直连 (UDP)? (Y/n): " y; then
-        read -r -p "  H3 端口 [回车随机]: " input || input=""
+        read -r -p "  H3 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
         if ! spec=$(_parse_port_spec "$input"); then
             _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
             spec=$(_parse_port_spec "")
@@ -1989,7 +1990,7 @@ _deploy_single_proto() {
         _warn "H3 已在运行（$(_port_desc "$h3_port" "$h3_public")），重新部署会更换端口。"
     fi
 
-    read -r -p "  ${label} 端口 [回车随机]: " input || input=""
+    read -r -p "  ${label} 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
     if ! spec=$(_parse_port_spec "$input"); then
         _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
         spec=$(_parse_port_spec "")
