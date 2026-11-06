@@ -646,6 +646,144 @@ _check_config() {
     return 1
 }
 
+# 端口监听检测：proto 取 t(TCP) 或 u(UDP)
+# 注意：ss -lnt / ss -lnu 的输出列是 State Recv-Q Send-Q Local Peer，本地地址在 $4
+#      （带 netid 的 ss -lntu 才是 $5，这里不要混用）
+_listen_check() {
+    local port="$1" proto="$2"
+    [ "$port" = "0" ] && { printf '%s' "-"; return 0; }
+    if command -v ss >/dev/null 2>&1; then
+        ss -ln"$proto" 2>/dev/null | awk 'NR>1 {print $4}' | grep -qE "[:.]${port}$" \
+            && printf '%s' "是" || printf '%s' "否"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ln"$proto" 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$" \
+            && printf '%s' "是" || printf '%s' "否"
+    else
+        printf '%s' "?"
+    fi
+}
+
+# 连通性自检：环境 / 端口监听 / 防火墙 / 证书 / 日志 / 结论
+_diag() {
+    _check_root
+    _detect_init_system
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 环境 ════════${NC}" >&2
+    echo -e "  脚本版本 : $(_version_full)" >&2
+    local core_ver="未安装"
+    [ -x "$XRAY_BIN" ] && core_ver=$("$XRAY_BIN" version 2>/dev/null | head -n1)
+    echo -e "  核心版本 : ${core_ver}" >&2
+    echo -e "  服务模式 : ${INIT_SYSTEM}" >&2
+    if _service_is_running; then
+        echo -e "  服务状态 : ${GREEN}运行中${NC}" >&2
+    else
+        echo -e "  服务状态 : ${RED}已停止${NC}" >&2
+    fi
+
+    if [ ! -s "$META_FILE" ]; then
+        _warn "尚未部署，无法继续自检。"
+        return 1
+    fi
+
+    local rp rpub hp hpub ap adom
+    IFS=$'\x1f' read -r rp rpub hp hpub ap adom < <(
+        jq -r '[((.reality_port // 0) | tostring),
+                ((.reality_public_port // .reality_port // 0) | tostring),
+                ((.h3_port // 0) | tostring),
+                ((.h3_public_port // .h3_port // 0) | tostring),
+                ((.argo_port // 0) | tostring),
+                (.argo_domain // "")]
+               | join("\u001f")' "$META_FILE" 2>/dev/null
+    )
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 端口监听 ════════${NC}" >&2
+    local r_tcp r_udp h_tcp h_udp
+    r_tcp=$(_listen_check "${rp:-0}" t)
+    r_udp=$(_listen_check "${rp:-0}" u)
+    h_tcp=$(_listen_check "${hp:-0}" t)
+    h_udp=$(_listen_check "${hp:-0}" u)
+    if [ "${rp:-0}" != "0" ]; then
+        echo -e "  Reality  : 监听 ${rp} → 对外 ${rpub}    TCP:${r_tcp}" >&2
+    else
+        echo -e "  Reality  : 未部署" >&2
+    fi
+    if [ "${hp:-0}" != "0" ]; then
+        echo -e "  H3       : 监听 ${hp} → 对外 ${hpub}    UDP:${h_udp}" >&2
+    else
+        echo -e "  H3       : 未部署" >&2
+    fi
+    if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
+        echo -e "  Argo     : 127.0.0.1:${ap} → ${adom}" >&2
+    else
+        echo -e "  Argo     : 未部署" >&2
+    fi
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 防火墙 ════════${NC}" >&2
+    local fw_shown=false
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        fw_shown=true
+        ufw status 2>/dev/null | grep -E "(${rp}|${rpub}|${hp}|${hpub})" | sed 's/^/  ufw: /' >&2
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        fw_shown=true
+        echo -e "  firewalld: $(firewall-cmd --list-ports 2>/dev/null)" >&2
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        fw_shown=true
+        echo -e "  iptables 命中端口规则:" >&2
+        iptables -S INPUT 2>/dev/null | grep -E "dport (${rp}|${rpub}|${hp}|${hpub})" | sed 's/^/    /' >&2 || true
+    fi
+    [ "$fw_shown" = false ] && echo -e "  ${YELLOW}未检测到本机防火墙${NC}" >&2
+
+    if [ -s "$CERT_FILE" ]; then
+        echo "" >&2
+        echo -e "${CYAN}════════ H3 证书 ════════${NC}" >&2
+        echo -e "  $(openssl x509 -in "$CERT_FILE" -noout -subject -dates 2>/dev/null | tr '\n' ' ')" >&2
+        local san
+        san=$(openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName 2>/dev/null | tail -n1)
+        echo -e "  SAN: ${san:-无（客户端需 allowInsecure）}" >&2
+    fi
+
+    echo "" >&2
+    echo -e "${CYAN}════════ Xray 日志（末 10 行）════════${NC}" >&2
+    tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' >&2 || echo "  (无日志)" >&2
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 结论 ════════${NC}" >&2
+    local issues=0
+
+    if [ "${hp:-0}" != "0" ] && [ "$h_udp" = "否" ]; then
+        issues=$((issues + 1))
+        _error "H3 已配置，但 UDP ${hp} 没有在监听 —— 核心没有起 QUIC 监听。"
+        echo -e "     XHTTP over H3 需要 Xray 1.8.19+，旧核心会静默忽略该 inbound。" >&2
+        echo -e "     处理：菜单 [10] 更新核心 → 重启服务，再回来看这一项。" >&2
+    fi
+    if [ "${hp:-0}" != "0" ] && [ "${hp}" != "${hpub}" ]; then
+        issues=$((issues + 1))
+        _warn "H3 用了端口映射 ${hp} → ${hpub}：云厂商安全组 / 路由器必须同时映射 UDP。"
+        echo -e "     只映射 TCP 的话 Reality 能通、H3 一定不通。" >&2
+    fi
+    if [ "${rp:-0}" != "0" ] && [ "$r_tcp" = "否" ]; then
+        issues=$((issues + 1))
+        _error "Reality 已配置，但 TCP ${rp} 没有在监听。"
+    fi
+    if ! _service_is_running; then
+        issues=$((issues + 1))
+        _error "Xray 服务未运行，所有节点都不会通。"
+        echo -e "     处理：菜单 [6] 启动服务，或查看日志定位。" >&2
+    fi
+    if [ "${hp:-0}" != "0" ] && [ "$h_udp" = "是" ] && _service_is_running; then
+        echo -e "  ${GREEN}服务端 H3 监听正常${NC}：若客户端仍不通，重点查云安全组 UDP、运营商 UDP 封锁、客户端核心版本。" >&2
+    fi
+    [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
+
+    echo "" >&2
+    return 0
+}
+
 # ==============================================================================
 #  服务托管
 # ==============================================================================
@@ -2502,7 +2640,7 @@ _main_menu() {
         echo -e "    ${GREEN}[6]${NC} 服务控制" >&2
         echo -e "    ${GREEN}[7]${NC} 查看实时日志" >&2
         echo -e "    ${GREEN}[8]${NC} 查看 Argo 日志" >&2
-        echo -e "    ${GREEN}[9]${NC} 检查配置文件" >&2
+        echo -e "    ${GREEN}[9]${NC} 诊断 (配置/端口/防火墙/日志)" >&2
         echo "" >&2
         echo -e "  ${CYAN}【维护】${NC}" >&2
         echo -e "    ${GREEN}[10]${NC} 更新 Xray 核心" >&2
@@ -2524,7 +2662,7 @@ _main_menu() {
             6) _service_menu ;;
             7) _view_log ;;
             8) _view_argo_log ;;
-            9) _check_config ;;
+            9) _check_config; echo "" >&2; _diag ;;
             10) _update_core ;;
             11) _update_script && exit 0 ;;
             12) _uninstall_deploy ;;
@@ -2571,6 +2709,7 @@ Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     start|stop|restart 控制 Xray 服务
     log               查看实时日志
     check             校验配置文件
+    diag              连通性自检（端口监听 / 防火墙 / 证书 / 日志 / 结论）
     update-core       更新 Xray 核心
     update-script     更新本脚本（同版本自动跳过，加 force 强制覆盖）
     -v | --version    查看当前脚本版本号
@@ -2673,6 +2812,10 @@ main() {
         check)
             _install_dependencies >/dev/null 2>&1
             _check_config
+            ;;
+        diag | diagnose)
+            _install_dependencies >/dev/null 2>&1
+            _diag
             ;;
         update-core)
             _update_core
