@@ -104,6 +104,13 @@ if ! head -n 1 "$_stage" | grep -q '^#!/bin/bash' || ! bash -n "$_stage" 2>/dev/
 fi
 
 # 3. 安装为全局命令 xg
+# 记录新旧版本号，便于确认本次安装/升级是否生效
+_old_ver=""
+if [ -f "$TARGET_BIN" ]; then
+    _old_ver=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$TARGET_BIN" 2>/dev/null | head -n1)
+fi
+_new_ver=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$_stage" 2>/dev/null | head -n1)
+
 mkdir -p "$(dirname "$TARGET_BIN")" || exit 1
 chmod 755 "$_stage" || { rm -f "$_stage"; exit 1; }
 if ! mv -f "$_stage" "$TARGET_BIN"; then
@@ -111,7 +118,14 @@ if ! mv -f "$_stage" "$TARGET_BIN"; then
     _error "安装到 ${TARGET_BIN} 失败。"
     exit 1
 fi
-_success "管理命令已安装: ${TARGET_BIN}"
+
+if [ -n "$_new_ver" ] && [ -n "$_old_ver" ] && [ "$_old_ver" != "$_new_ver" ]; then
+    _success "管理命令已安装: ${TARGET_BIN}   V${_old_ver} -> V${_new_ver}"
+elif [ -n "$_new_ver" ]; then
+    _success "管理命令已安装: ${TARGET_BIN}   V${_new_ver}"
+else
+    _success "管理命令已安装: ${TARGET_BIN}"
+fi
 
 # 4. 带参数时直接执行
 case "${1:-}" in
@@ -132,6 +146,8 @@ echo -e "    ${GREEN}3${NC}) 查看节点链接" >&2
 echo -e "    ${GREEN}4${NC}) 查看运行状态" >&2
 echo -e "    ${GREEN}5${NC}) 卸载部署" >&2
 echo -e "    ${YELLOW}0${NC}) 退出" >&2
+echo "" >&2
+echo -e "  ${CYAN}确认版本：${NC} xg -v     ${CYAN}升级脚本：${NC} xg update-script" >&2
 echo "" >&2
 
 if [ -t 0 ]; then

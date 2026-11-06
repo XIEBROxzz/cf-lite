@@ -80,6 +80,16 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 
 也可以直接带数字：`xg 1` ~ `xg 5`。
 
+当前版本 **V1.0**（构建 2026-11-06），随时可确认装的是哪一版：
+
+```bash
+xg -v        # 输出: Xray-go V1.0 (2026-11-06)
+xg status    # 状态页显示「脚本版本 : V1.0 (2026-11-06)」
+xg           # 菜单标题栏直接显示 V1.0
+```
+
+更新脚本会明确回显版本变化：`V1.0 -> V1.1`；版本相同则提示「当前已是最新版本」；需要强制覆盖重装用 `xg update-script force`。
+
 **特点**
 
 - **XHTTP H3 直连**：HTTP/3 标准 UDP 传输，低延迟高吞吐，不易被运营商 QoS

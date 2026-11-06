@@ -13,7 +13,9 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 # 配置、元数据、私钥仅 root 可读写
 umask 077
 
-export SCRIPT_VERSION="2.2.0"
+# 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
+export SCRIPT_VERSION="1.0"
+export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
 # Github Cloudflare 安全代理（优先直连官方，失败后轮询代理）
@@ -65,6 +67,11 @@ _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
 _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
 _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
+
+# 统一版本标签：V1.0
+_version_tag() { printf 'V%s' "${SCRIPT_VERSION}"; }
+# 完整版本串：V1.0 (2026-11-06)
+_version_full() { printf 'V%s (%s)' "${SCRIPT_VERSION}" "${SCRIPT_BUILD}"; }
 
 # ==============================================================================
 #  基础工具
@@ -1877,6 +1884,7 @@ _show_status() {
     echo "" >&2
     echo -e "${CYAN}  ───── 运行状态 ─────${NC}" >&2
     echo -e "  系统环境 : $(uname -s) $(uname -m)  |  服务模式: ${INIT_SYSTEM}" >&2
+    echo -e "  脚本版本 : ${GREEN}$(_version_full)${NC}" >&2
     echo -e "  核心版本 : ${ver}" >&2
 
     if _service_is_running; then
@@ -2024,7 +2032,8 @@ _uninstall_deploy() {
 
 _update_script() {
     _check_root
-    _info "正在检查脚本更新..."
+    local force="${1:-}"
+    _info "正在检查脚本更新... 当前版本 $(_version_tag)"
 
     local stage
     stage=$(mktemp /var/tmp/.xray-go.sh.new.XXXXXX) || return 1
@@ -2039,6 +2048,17 @@ _update_script() {
         rm -f "$stage"
         _error "下载的脚本未通过语法校验，已拒绝覆盖。"
         return 1
+    fi
+
+    # 从新脚本中提取版本号，用于更新前后的对比提示
+    local new_ver
+    new_ver=$(sed -n 's/^export SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$stage" 2>/dev/null | head -n1)
+
+    if [ -n "$new_ver" ] && [ "$new_ver" = "$SCRIPT_VERSION" ] && [ "$force" != "force" ]; then
+        rm -f "$stage"
+        _success "当前已是最新版本 V${SCRIPT_VERSION}，无需更新。"
+        _info "如需强制覆盖重装: $(basename "$0") update-script force"
+        return 0
     fi
 
     local self_path target
@@ -2064,8 +2084,15 @@ _update_script() {
         return 1
     fi
 
-    _success "脚本已更新: ${target}"
-    _info "重新运行以应用变更: ${target}"
+    if [ -n "$new_ver" ] && [ "$new_ver" != "$SCRIPT_VERSION" ]; then
+        _success "脚本已更新: V${SCRIPT_VERSION}  ->  V${new_ver}"
+    elif [ -n "$new_ver" ]; then
+        _success "脚本已覆盖重装: V${new_ver}（版本号未变化）"
+    else
+        _success "脚本已更新（远端未标注版本号）"
+    fi
+    _info "文件位置: ${target}"
+    _info "重新运行 ${target} 即可应用变更；用 -v 可确认版本。"
     return 0
 }
 
@@ -2156,7 +2183,7 @@ _main_menu() {
         echo '                 /____/   Xray-go    '
         echo -e "${NC}"
         echo -e "${CYAN}  ╔══════════════════════════════════════════╗"
-        echo -e "  ║     Xray-go 一键部署管理脚本 v${SCRIPT_VERSION}     ║"
+        echo -e "  ║     Xray-go 一键部署管理脚本 V${SCRIPT_VERSION}       ║"
         echo -e "  ╚══════════════════════════════════════════╝${NC}"
         echo "" >&2
 
@@ -2215,7 +2242,7 @@ _main_menu() {
 
 _print_help() {
     cat >&2 <<EOF
-Xray-go 管理脚本 v${SCRIPT_VERSION}
+Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
 
 用法: $(basename "$0") [快捷指令 | 命令]
 
@@ -2239,7 +2266,8 @@ Xray-go 管理脚本 v${SCRIPT_VERSION}
     log               查看实时日志
     check             校验配置文件
     update-core       更新 Xray 核心
-    update-script     更新本脚本
+    update-script     更新本脚本（同版本自动跳过，加 force 强制覆盖）
+    -v | --version    查看当前脚本版本号
     uninstall         卸载部署（含云端隧道 + DNS + 本地文件）
 
 兼容旧版参数写法（示例）:
@@ -2260,7 +2288,7 @@ main() {
             return 0
             ;;
         -v | --version)
-            echo "v${SCRIPT_VERSION}"
+            echo "Xray-go $(_version_full)"
             return 0
             ;;
     esac
@@ -2333,7 +2361,7 @@ main() {
             _update_core
             ;;
         update-script)
-            _update_script
+            _update_script "${2:-}"
             ;;
         uninstall)
             _uninstall_deploy
