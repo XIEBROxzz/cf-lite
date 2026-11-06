@@ -1,19 +1,19 @@
 
 ## 🗂️ 三套方案：CF-A / CF-B / CF-C
 
-**CF-A**  快捷键X
+**CF-A**  快捷键X CF CDN橙云
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_cf_lite.sh)
 ```
 
-**CF-B** 快捷键sb
+**CF-B** 快捷键sb sing-box argo
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/singbox-lite_tunnel.sh)
 ```
 
-**CF-C** 快捷键xg
+**CF-C** 快捷键xg xray-argo-h3 quic 
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
