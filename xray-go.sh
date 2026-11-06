@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.9"
+export SCRIPT_VERSION="2.10"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -1075,6 +1075,194 @@ _argo_action() {
     esac
 }
 
+# ── Argo 保活（cron watchdog）─────────────────────────────────────────
+# 服务托管层只能救「进程退出」：systemd 靠 Restart=always，openrc 靠
+# supervise-daemon；而 openrc 老模板用 command_background，崩了不会自己起来。
+# 这一层用 crontab 每分钟巡检一次：进程不在就拉起；进程在但连续 3 分钟
+# 一条边缘连接都没有，也重启（对应「4 条通道全断但进程僵着」的情况）。
+#
+# 保活脚本落到 $XRAY_DIR 下独立执行 —— xg 是临时下载后跑的，没有固定路径，
+# 不能像 CF-B 那样直接让 cron 调主脚本。
+KEEPALIVE_SCRIPT="${XRAY_DIR}/argo-keepalive.sh"
+
+_write_keepalive_script() {
+    local init="$1"
+    cat > "$KEEPALIVE_SCRIPT" <<'KEEPEOF'
+#!/bin/sh
+# Xray-go Argo 隧道保活（由 xg 生成，crontab 每分钟调用，请勿手改）
+STATE="@XRAY_DIR@"
+INIT_SYSTEM="@INIT@"
+CLOUDFLARED="@CLOUDFLARED@"
+ARGO_LOG="@ARGO_LOG@"
+META="$STATE/meta.json"
+ARGO_PID="@ARGO_PID@"
+STRIKE="$STATE/argo-keepalive.strike"
+
+[ -s "$META" ] || exit 0
+grep -q 'argo_token' "$META" 2>/dev/null || exit 0
+
+# 上一轮还没跑完就跳过，避免 cron 叠加
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$STATE/argo-keepalive.lock" 2>/dev/null || exit 0
+    flock -n 9 2>/dev/null || exit 0
+fi
+
+_log() { command -v logger >/dev/null 2>&1 && logger -t xg-keepalive "$*" 2>/dev/null; }
+
+_restart() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl reset-failed xray-argo >/dev/null 2>&1
+            systemctl restart xray-argo >/dev/null 2>&1
+            ;;
+        openrc)
+            rc-service xray-argo stop >/dev/null 2>&1
+            sleep 1
+            rc-service xray-argo start >/dev/null 2>&1
+            ;;
+        *)
+            [ -x "$CLOUDFLARED" ] || return 0
+            [ -f "$STATE/argo.env" ] || return 0
+            set -a; . "$STATE/argo.env"; set +a
+            _proto=$(sed -n 's/.*"argo_protocol"[^,}]*"\([a-z0-9]*\)".*/\1/p' "$META" 2>/dev/null | head -n1)
+            [ -n "$_proto" ] || _proto="quic"
+            nohup "$CLOUDFLARED" tunnel --no-autoupdate --retries 5 --grace-period 1s \
+                --protocol "$_proto" --ha-connections 4 run >> "$ARGO_LOG" 2>&1 &
+            echo $! > "$ARGO_PID"
+            ;;
+    esac
+}
+
+running=0
+case "$INIT_SYSTEM" in
+    systemd) systemctl is-active --quiet xray-argo 2>/dev/null && running=1 ;;
+    openrc)  rc-service xray-argo status 2>/dev/null | grep -q started && running=1 ;;
+    *)
+        if [ -f "$ARGO_PID" ]; then
+            _pid=$(cat "$ARGO_PID" 2>/dev/null)
+            [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && running=1
+        fi
+        ;;
+esac
+
+if [ "$running" = "0" ]; then
+    _log "Argo 隧道未运行，正在拉起"
+    _restart
+    echo 0 > "$STRIKE" 2>/dev/null
+    exit 0
+fi
+
+# 进程在，但到边缘一条连接都没有：连续 3 次才动手，避开刚启动的空窗期
+conns=0
+for f in /proc/net/udp /proc/net/udp6; do
+    [ -r "$f" ] || continue
+    n=$(awk 'FNR>1 && $3 ~ /:1EA4$/ {c++} END{print c+0}' "$f" 2>/dev/null)
+    conns=$((conns + ${n:-0}))
+done
+for f in /proc/net/tcp /proc/net/tcp6; do
+    [ -r "$f" ] || continue
+    n=$(awk 'FNR>1 && $3 ~ /:1EA4$/ && $4=="01" {c++} END{print c+0}' "$f" 2>/dev/null)
+    conns=$((conns + ${n:-0}))
+done
+
+if [ "$conns" -gt 0 ] 2>/dev/null; then
+    echo 0 > "$STRIKE" 2>/dev/null
+    exit 0
+fi
+
+strike=$(cat "$STRIKE" 2>/dev/null)
+strike=${strike:-0}
+strike=$((strike + 1))
+echo "$strike" > "$STRIKE" 2>/dev/null
+if [ "$strike" -ge 3 ]; then
+    _log "Argo 隧道连续 3 分钟无边缘连接，正在重启"
+    echo 0 > "$STRIKE" 2>/dev/null
+    _restart
+fi
+exit 0
+KEEPEOF
+    # 注入本机路径与托管方式（用占位符替换，避免 heredoc 里大量转义）
+    sed -i \
+        -e "s#@XRAY_DIR@#${XRAY_DIR}#g" \
+        -e "s#@INIT@#${init}#g" \
+        -e "s#@CLOUDFLARED@#${CLOUDFLARED_BIN}#g" \
+        -e "s#@ARGO_LOG@#${ARGO_LOG_FILE}#g" \
+        -e "s#@ARGO_PID@#${ARGO_PID_FILE}#g" \
+        "$KEEPALIVE_SCRIPT" 2>/dev/null || true
+    chmod 755 "$KEEPALIVE_SCRIPT" 2>/dev/null || true
+}
+
+# cron 命令在、服务也在跑才算可用（Alpine 是 dcron，Debian 是 cron）
+_ensure_cron_service() {
+    local s started=false pkg="cron"
+    if ! command -v crontab >/dev/null 2>&1; then
+        command -v apk >/dev/null 2>&1 && pkg="dcron"
+        command -v apt-get >/dev/null 2>&1 && pkg="cron"
+        command -v dnf >/dev/null 2>&1 && pkg="cronie"
+        command -v yum >/dev/null 2>&1 && pkg="cronie"
+        _info "正在安装 cron 依赖: ${pkg} ..."
+        _pkg_install "$pkg" >/dev/null 2>&1 || true
+        command -v crontab >/dev/null 2>&1 || return 1
+    fi
+    case "$INIT_SYSTEM" in
+        systemd)
+            for s in cron crond cronie; do
+                if systemctl enable --now "${s}.service" >/dev/null 2>&1; then
+                    started=true; break
+                fi
+            done
+            ;;
+        openrc)
+            for s in dcron crond cronie cron; do
+                if rc-service "$s" start >/dev/null 2>&1; then
+                    rc-update add "$s" default >/dev/null 2>&1 || true
+                    started=true; break
+                fi
+            done
+            ;;
+        *)
+            for s in cron crond; do
+                if service "$s" start >/dev/null 2>&1; then started=true; break; fi
+            done
+            ;;
+    esac
+    [ "$started" = true ]
+}
+
+_watchdog_enabled() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -Fq "$KEEPALIVE_SCRIPT"
+}
+
+_enable_argo_watchdog() {
+    local job
+    _write_keepalive_script "$INIT_SYSTEM" || return 1
+    if ! _ensure_cron_service; then
+        _warn "cron 不可用，保活未启用（服务托管层仍会兜底）。"
+        return 1
+    fi
+    if _watchdog_enabled; then
+        _info "Argo 保活已在运行（每分钟巡检）。"
+        return 0
+    fi
+    job="* * * * * /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1"
+    if (crontab -l 2>/dev/null; echo "$job") | crontab - 2>/dev/null; then
+        _success "Argo 保活已启用：每分钟巡检，进程退出或无边缘连接时自动重启。"
+        return 0
+    fi
+    _warn "写入 crontab 失败，保活未启用。"
+    return 1
+}
+
+_disable_argo_watchdog() {
+    if _watchdog_enabled; then
+        crontab -l 2>/dev/null | grep -Fv "$KEEPALIVE_SCRIPT" | crontab - 2>/dev/null || true
+        _info "Argo 保活已移除。"
+    fi
+    rm -f "$KEEPALIVE_SCRIPT" 2>/dev/null || true
+    return 0
+}
+
 _setup_argo() {
     local token="$1" proto="$2" conns
     conns=$(_argo_connections "$proto")
@@ -1677,6 +1865,7 @@ _uninstall_deploy() {
     fi
 
     _info "正在停止服务..."
+    _disable_argo_watchdog
     _stop_all_services
 
     # 先清理云端（需要在删除凭据文件之前完成）
@@ -2136,6 +2325,9 @@ _deploy_argo() {
     fi
     _success "Argo 隧道已启动。"
 
+    # 第二层保活：cron 每分钟巡检，进程退出或无边缘连接时自动重启
+    _enable_argo_watchdog || _warn "保活未启用，隧道崩溃后需要手动 xg restart。"
+
     echo "" >&2
     echo -e "${GREEN}──────────── 部署完成 ────────────${NC}" >&2
     echo -e "  隧道域名 : ${ARGO_DOMAIN}" >&2
@@ -2194,6 +2386,13 @@ _show_status() {
         esac
         echo -e "  隧道     : $(jq -r 'if (.argo_port // 0) > 0 then ((.argo_domain // "-") + "  (" + (.argo_protocol // "http2") + " / 127.0.0.1:" + (.argo_port | tostring) + ")") else "未配置" end' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
+        if _watchdog_enabled; then
+            echo -e "  自动保活 : ${GREEN}已开启${NC}（cron 每分钟巡检，崩溃自动拉起）" >&2
+        elif [ -x "$KEEPALIVE_SCRIPT" ]; then
+            echo -e "  自动保活 : ${YELLOW}脚本在但 cron 未挂${NC}（${CYAN}xg keepalive-on${NC}）" >&2
+        else
+            echo -e "  自动保活 : ${YELLOW}未开启${NC}（${CYAN}xg keepalive-on${NC} 开启）" >&2
+        fi
     else
         echo -e "  隧道     : ${YELLOW}尚未部署${NC}" >&2
     fi
@@ -2337,6 +2536,9 @@ Xray-go · Argo 隧道版 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     start|stop|restart 控制 Xray 服务
     log               查看 Xray 实时日志
     argo-log          查看 Argo 实时日志
+    keepalive         手动执行一次保活巡检（cron 也是调它）
+    keepalive-on      开启 Argo 自动保活（cron 每分钟巡检，崩溃自动拉起）
+    keepalive-off     关闭 Argo 自动保活
     rebuild           由 meta.json 重建配置并重启（端口/链接不变）
     check             校验配置文件
     diag              连通性自检（本地监听 / Argo 走 UDP 还是 TCP / 日志 / 结论）
@@ -2426,6 +2628,23 @@ main() {
             ;;
         argo-log)
             _view_argo_log
+            ;;
+        keepalive | watchdog)
+            # 手动跑一次巡检（cron 也是调这个脚本，行为完全一致）
+            if [ -x "$KEEPALIVE_SCRIPT" ]; then
+                /bin/sh "$KEEPALIVE_SCRIPT"
+                _success "已执行一次保活巡检。"
+            else
+                _error "保活脚本不存在，先执行: xg keepalive-on"
+                return 1
+            fi
+            ;;
+        keepalive-on | watchdog-on)
+            _enable_argo_watchdog || return 1
+            ;;
+        keepalive-off | watchdog-off)
+            _disable_argo_watchdog
+            _success "Argo 保活已关闭。"
             ;;
         check)
             _install_dependencies >/dev/null 2>&1
