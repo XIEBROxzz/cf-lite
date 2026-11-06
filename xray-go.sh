@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.2"
+export SCRIPT_VERSION="2.3"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -157,14 +157,30 @@ _install_dependencies() {
     return 0
 }
 
+# 服务文件权限要按 init 系统区分：
+#   systemd 的 unit 只需可读，600 没问题；
+#   openrc 的 /etc/init.d/xray 是要被 rc-service 执行的脚本，必须 755，
+#   否则 rc-service 会报 “* rc-service: Permission denied”。
+_fix_service_perms() {
+    local f="$1"
+    [ -n "$f" ] && [ -f "$f" ] || return 0
+    case "$INIT_SYSTEM" in
+        openrc) chmod 755 "$f" 2>/dev/null || true ;;
+        *)      chmod 600 "$f" 2>/dev/null || true ;;
+    esac
+    return 0
+}
+
 _secure_permissions() {
     [ -d "$XRAY_DIR" ] && chmod 700 "$XRAY_DIR" 2>/dev/null || true
     [ -d "$RUNTIME_DIR" ] && chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
     local f
     for f in "$CONFIG_FILE" "$META_FILE" "$LINKS_FILE" "$ARGO_ENV_FILE" \
-             "$DEP_STATE_FILE" "$CF_CRED_FILE" "$SERVICE_FILE" "$ARGO_SERVICE_FILE"; do
+             "$DEP_STATE_FILE" "$CF_CRED_FILE"; do
         [ -f "$f" ] && chmod 600 "$f" 2>/dev/null || true
     done
+    _fix_service_perms "$SERVICE_FILE"
+    _fix_service_perms "$ARGO_SERVICE_FILE"
     return 0
 }
 
@@ -616,6 +632,10 @@ _service_file_is_ours() {
 # 启动/重启前确保服务文件归自己；被别人占着就重写（幂等，可反复调用）
 _ensure_service_owned() {
     if _service_file_is_ours; then
+        # 老版本 _secure_permissions 会把 openrc 的 init 脚本也 chmod 600，
+        # 导致 rc-service 报 Permission denied。这里顺手修正，已坏的环境下次 restart 即自愈。
+        _fix_service_perms "$SERVICE_FILE"
+        _fix_service_perms "$ARGO_SERVICE_FILE"
         # 顺手补回开机自启：CF-A 卸载时执行过 systemctl disable xray
         case "$INIT_SYSTEM" in
             systemd) systemctl enable xray >/dev/null 2>&1 || true ;;
@@ -1625,7 +1645,12 @@ _diag() {
     # 服务文件被别人占着时，本脚本怎么启都是启别人的服务（CF-A 遗留的典型症状）
     if [ -n "$SERVICE_FILE" ] && [ -f "$SERVICE_FILE" ]; then
         if _service_file_is_ours; then
-            echo -e "  服务文件 : 正常（本脚本）" >&2
+            # openrc 的 init 脚本必须可执行，否则 rc-service 直接 Permission denied
+            if [ "$INIT_SYSTEM" = "openrc" ] && [ ! -x "$SERVICE_FILE" ]; then
+                echo -e "  服务文件 : ${RED}权限异常${NC}（${SERVICE_FILE} 不可执行）" >&2
+            else
+                echo -e "  服务文件 : 正常（本脚本）" >&2
+            fi
         else
             echo -e "  服务文件 : ${RED}被其他脚本占用${NC}（${SERVICE_FILE}）" >&2
         fi
