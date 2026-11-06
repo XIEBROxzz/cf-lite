@@ -171,7 +171,19 @@ rm -f "$LOG_FILE" "$ARGO_LOG_FILE"
 
 echo "" >&2
 _success "Xray-go 已卸载完成。"
+
 if [ -x "/usr/local/bin/xg" ]; then
-    _info "管理命令仍保留：/usr/local/bin/xg（如需删除请执行 rm -f /usr/local/bin/xg）"
+    if [ "$SKIP_CONFIRM" = "true" ]; then
+        _info "管理命令仍保留：/usr/local/bin/xg（删除: rm -f /usr/local/bin/xg）"
+    else
+        read -r -p "  是否同时删除管理命令 /usr/local/bin/xg? (y/N): " del_xg || del_xg=""
+        if [[ "${del_xg,,}" =~ ^(y|yes)$ ]]; then
+            rm -f /usr/local/bin/xg 2>/dev/null \
+                && _success "管理命令已删除: /usr/local/bin/xg" \
+                || _warn "删除失败，请手动执行 rm -f /usr/local/bin/xg"
+        else
+            _info "已保留管理命令：/usr/local/bin/xg"
+        fi
+    fi
 fi
 echo "" >&2

@@ -2027,6 +2027,18 @@ _uninstall_deploy() {
     rm -f "$LOG_FILE" "$ARGO_LOG_FILE"
 
     _success "Xray-go 已卸载完成。"
+
+    # 管理命令 xg 默认保留，按需一并删除，避免"卸完还留个 xg"的疑惑
+    local self_cmd="/usr/local/bin/xg"
+    if [ -f "$self_cmd" ]; then
+        if _ask_yes "  是否同时删除管理命令 ${self_cmd}? (y/N): " n; then
+            rm -f "$self_cmd" 2>/dev/null \
+                && _success "管理命令已删除: ${self_cmd}" \
+                || _warn "删除 ${self_cmd} 失败，请手动执行 rm -f ${self_cmd}"
+        else
+            _info "已保留管理命令: ${self_cmd}（可继续用它重新部署）"
+        fi
+    fi
     return 0
 }
 

@@ -112,4 +112,21 @@ xg           # 菜单标题栏直接显示 V1.0
 | :--- | :--- |
 | A | 运行 `x` → 菜单内卸载 |
 | B | 运行 `sb` → 菜单内卸载 |
-| C | `xg 5`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)`（含云端隧道 + DNS + 本地文件） |
+| C | **二选一**：`xg 5`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)` |
+
+> 两种方式**等价，跑一条即可**，不是两条都要执行。
+>
+> - `xg 5`：本机还留着 `xg` 命令时用，走菜单里的卸载项。
+> - `bash <(curl -Ls ...)`：不依赖本地命令，直接从仓库拉最新卸载脚本执行。适合 `xg` 已被删除、脚本文件损坏，或想确保用最新卸载逻辑的情况。
+
+**清理范围（两条路径完全一致）**
+
+1. 停止并移除服务：systemd unit（`xray.service` / `xray-argo.service`）、openrc 服务、direct 模式后台进程（按 pidfile 精确 kill）
+2. 删除 Cloudflare 云端隧道（`?cascade=true`）及对应 DNS 解析记录
+3. 删除 `/etc/xray`：配置、证书、私钥、`cloudflared`、CF 凭据
+4. 删除 `/run/xraygo`（pidfile）与 `/var/log/xray.log`、`/var/log/xray-argo.log`
+5. 最后询问是否一并删除 `/usr/local/bin/xg`
+
+**会保留的**：系统依赖（`curl` / `jq` / `openssl` / `unzip`）；`/usr/local/bin/xg` 默认保留，第 5 步选 `y` 才删。
+
+**唯一需要手动收尾的情况**：Argo 是手动填 Token 部署的（`meta.json` 里没有 `tunnel_id`），脚本无从得知隧道归属，卸载时会提示你去 Cloudflare 控制台手动删除隧道和 DNS。
