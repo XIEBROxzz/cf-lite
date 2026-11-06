@@ -2183,7 +2183,7 @@ _main_menu() {
         echo '                 /____/   Xray-go    '
         echo -e "${NC}"
         echo -e "${CYAN}  ╔══════════════════════════════════════════╗"
-        echo -e "  ║     Xray-go 一键部署管理脚本 V${SCRIPT_VERSION}       ║"
+        echo -e "  ║     Xray-go 一键部署管理脚本 V${SCRIPT_VERSION}        ║"
         echo -e "  ╚══════════════════════════════════════════╝${NC}"
         echo "" >&2
 
