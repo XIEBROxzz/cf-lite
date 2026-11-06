@@ -185,12 +185,59 @@ _is_pid_file_running_cmd() {
 }
 
 _rand_port() {
-    local lo=20000 hi=60000 p=""
+    local lo=30000 hi=50000 p=""
     if command -v shuf >/dev/null 2>&1; then
         p=$(shuf -i ${lo}-${hi} -n 1 2>/dev/null)
     fi
     [[ "$p" =~ ^[0-9]+$ ]] || p=$(( (RANDOM * 32768 + RANDOM) % (hi - lo + 1) + lo ))
     printf '%s' "$p"
+}
+
+# 解析端口写法，输出 "<监听端口> <对外端口>"
+#   443         -> 监听 443，对外 443
+#   443:31000   -> 监听 443，对外 31000（NAT / 端口映射）
+#   空          -> 30000-50000 随机，内外一致
+# 无效返回 1
+_parse_port_spec() {
+    local spec listen public p
+    spec=$(printf '%s' "${1:-}" | tr -d '[:space:]')
+
+    if [ -z "$spec" ]; then
+        p=$(_pick_free_port)
+        printf '%s %s' "$p" "$p"
+        return 0
+    fi
+
+    case "$spec" in
+        *:*:*)
+            return 1
+            ;;
+    esac
+
+    case "$spec" in
+        *:*)
+            listen="${spec%%:*}"
+            public="${spec##*:}"
+            ;;
+        *)
+            listen="$spec"
+            public="$spec"
+            ;;
+    esac
+
+    [[ "$listen" =~ ^[0-9]+$ ]] && [ "$listen" -ge 1 ] && [ "$listen" -le 65535 ] || return 1
+    [[ "$public" =~ ^[0-9]+$ ]] && [ "$public" -ge 1 ] && [ "$public" -le 65535 ] || return 1
+    printf '%s %s' "$listen" "$public"
+}
+
+# 端口展示：443 + 31000 -> "443 → 对外 31000"；相同则只显示一个
+_port_desc() {
+    local l="$1" p="${2:-}"
+    if [ -z "$p" ] || [ "$l" = "$p" ]; then
+        printf '%s' "$l"
+    else
+        printf '%s → 对外 %s' "$l" "$p"
+    fi
 }
 
 _port_in_use() {
@@ -1326,8 +1373,8 @@ _show_links() {
     IFS=$'\x1f' read -r uuid reality_port reality_sni reality_pub reality_sid h3_port h3_path \
         argo_port argo_path argo_domain argo_protocol saved_ip < <(
         jq -r '[.uuid // "",
-                ((.reality_port // 0) | tostring), (.reality_sni // ""), (.reality_public_key // ""), (.reality_short_id // ""),
-                ((.h3_port // 0) | tostring), (.h3_path // ""),
+                ((.reality_public_port // .reality_port // 0) | tostring), (.reality_sni // ""), (.reality_public_key // ""), (.reality_short_id // ""),
+                ((.h3_public_port // .h3_port // 0) | tostring), (.h3_path // ""),
                 ((.argo_port // 0) | tostring), (.argo_path // ""), (.argo_domain // ""), (.argo_protocol // ""),
                 (.server_ip // "")]
                | join("\u001f")' "$META_FILE" 2>/dev/null
@@ -1392,6 +1439,7 @@ _show_links() {
 _deploy_all() {
     local reality_port="$1" h3_port="$2" argo_protocol="$3" argo_port="$4" argo_domain="$5" argo_token="$6"
     local argo_tunnel_id="${7:-}" argo_zone_id="${8:-}"
+    local reality_public="${9:-}" h3_public="${10:-}"
 
     _check_root
     _detect_init_system
@@ -1399,6 +1447,10 @@ _deploy_all() {
     reality_port=$(_num_or_zero "$reality_port")
     h3_port=$(_num_or_zero "$h3_port")
     argo_port=$(_num_or_zero "$argo_port")
+    reality_public=$(_num_or_zero "$reality_public")
+    h3_public=$(_num_or_zero "$h3_public")
+    [ "$reality_public" = "0" ] && reality_public="$reality_port"
+    [ "$h3_public" = "0" ] && h3_public="$h3_port"
 
     if [ "$reality_port" = "0" ] && [ "$h3_port" = "0" ] && [ -z "$argo_token" ]; then
         _error "未选择任何协议（Reality / H3 / Argo 均为空），已取消部署。"
@@ -1455,11 +1507,13 @@ _deploy_all() {
     if ! jq -n \
         --arg uuid "$uuid" \
         --argjson reality_port "$reality_port" \
+        --argjson reality_public_port "$reality_public" \
         --arg reality_sni "$DEFAULT_REALITY_SNI" \
         --arg reality_private_key "$private_key" \
         --arg reality_public_key "$public_key" \
         --arg reality_short_id "$short_id" \
         --argjson h3_port "$h3_port" \
+        --argjson h3_public_port "$h3_public" \
         --arg h3_path "$h3_path" \
         --argjson argo_port "$argo_port" \
         --arg argo_path "$argo_path" \
@@ -1473,11 +1527,13 @@ _deploy_all() {
         '{
             uuid: $uuid,
             reality_port: $reality_port,
+            reality_public_port: $reality_public_port,
             reality_sni: $reality_sni,
             reality_private_key: $reality_private_key,
             reality_public_key: $reality_public_key,
             reality_short_id: $reality_short_id,
             h3_port: $h3_port,
+            h3_public_port: $h3_public_port,
             h3_path: $h3_path,
             argo_port: $argo_port,
             argo_path: $argo_path,
@@ -1521,13 +1577,13 @@ _deploy_all() {
         fi
     fi
 
-    _apply_firewall "$reality_port" "$h3_port"
+    _apply_firewall "$reality_port" "$reality_public" "$h3_port" "$h3_public"
 
     echo "" >&2
     echo -e "${GREEN}──────────── 部署完成 ────────────${NC}" >&2
     local reality_show h3_show
-    if [ "$reality_port" = "0" ]; then reality_show="未启用"; else reality_show="$reality_port"; fi
-    if [ "$h3_port" = "0" ]; then h3_show="未启用"; else h3_show="$h3_port"; fi
+    if [ "$reality_port" = "0" ]; then reality_show="未启用"; else reality_show=$(_port_desc "$reality_port" "$reality_public"); fi
+    if [ "$h3_port" = "0" ]; then h3_show="未启用"; else h3_show=$(_port_desc "$h3_port" "$h3_public"); fi
     echo -e "  Reality 端口 : ${reality_show}" >&2
     echo -e "  H3 端口      : ${h3_show}" >&2
     echo -e "  Argo 端口    : ${argo_port}  (${argo_protocol})" >&2
@@ -1556,12 +1612,33 @@ _one_click_deploy() {
         fi
     fi
 
-    local reality_port h3_port
-    reality_port=$(_pick_free_port)
-    h3_port=$(_pick_free_port)
-    while [ "$h3_port" = "$reality_port" ]; do
-        h3_port=$(_pick_free_port)
-    done
+    local reality_port h3_port reality_public h3_public input spec
+
+    if [ -t 0 ]; then
+        read -r -p "  Reality 端口 [回车随机]: " input || input=""
+        if ! spec=$(_parse_port_spec "$input"); then
+            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
+            spec=$(_parse_port_spec "")
+        fi
+        reality_port="${spec%% *}"; reality_public="${spec##* }"
+
+        input=""
+        read -r -p "  H3 端口      [回车随机]: " input || input=""
+        if ! spec=$(_parse_port_spec "$input"); then
+            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
+            spec=$(_parse_port_spec "")
+        fi
+        h3_port="${spec%% *}"; h3_public="${spec##* }"
+    else
+        spec=$(_parse_port_spec "")
+        reality_port="${spec%% *}"; reality_public="${spec##* }"
+        spec=$(_parse_port_spec "")
+        h3_port="${spec%% *}"; h3_public="${spec##* }"
+        while [ "$h3_port" = "$reality_port" ]; do
+            spec=$(_parse_port_spec "")
+            h3_port="${spec%% *}"; h3_public="${spec##* }"
+        done
+    fi
 
     # 已存在的 Argo 配置在重部署时沿用，避免掉线
     local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
@@ -1601,8 +1678,8 @@ _one_click_deploy() {
 
     echo "" >&2
     echo -e "${CYAN}  一键部署预览${NC}" >&2
-    echo -e "    VLESS-TCP-REALITY-Vision : 端口 ${GREEN}${reality_port}${NC}" >&2
-    echo -e "    VLESS-XHTTP-H3 (UDP)     : 端口 ${GREEN}${h3_port}${NC}" >&2
+    echo -e "    VLESS-TCP-REALITY-Vision : 端口 ${GREEN}$(_port_desc "$reality_port" "$reality_public")${NC}" >&2
+    echo -e "    VLESS-XHTTP-H3 (UDP)     : 端口 ${GREEN}$(_port_desc "$h3_port" "$h3_public")${NC}" >&2
     if [ -n "$argo_token" ]; then
         echo -e "    XHTTP-Argo 隧道          : ${argo_protocol} / ${argo_domain}" >&2
     else
@@ -1611,7 +1688,8 @@ _one_click_deploy() {
     echo "" >&2
 
     _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
-        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id"
+        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id" \
+        "$reality_public" "$h3_public"
 }
 
 _custom_deploy() {
@@ -1621,27 +1699,27 @@ _custom_deploy() {
     echo "" >&2
     echo -e "${CYAN}  === 自定义部署 ===${NC}" >&2
 
-    local reality_port="0" h3_port="0" input=""
+    local reality_port="0" h3_port="0" reality_public="0" h3_public="0" input="" spec
 
     if _ask_yes "  是否部署 VLESS-TCP-REALITY-Vision? (Y/n): " y; then
-        read -r -p "  Reality 端口 (回车随机): " input || input=""
-        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
-            reality_port="$input"
-        else
-            reality_port=$(_pick_free_port)
-            _info "已分配 Reality 随机端口: ${reality_port}"
+        read -r -p "  Reality 端口 [回车随机]: " input || input=""
+        if ! spec=$(_parse_port_spec "$input"); then
+            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
+            spec=$(_parse_port_spec "")
         fi
+        reality_port="${spec%% *}"; reality_public="${spec##* }"
+        _info "Reality 端口: $(_port_desc "$reality_port" "$reality_public")"
     fi
 
     input=""
     if _ask_yes "  是否部署 XHTTP-H3 直连 (UDP)? (Y/n): " y; then
-        read -r -p "  H3 端口 (回车随机): " input || input=""
-        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
-            h3_port="$input"
-        else
-            h3_port=$(_pick_free_port)
-            _info "已分配 H3 随机端口: ${h3_port}"
+        read -r -p "  H3 端口 [回车随机]: " input || input=""
+        if ! spec=$(_parse_port_spec "$input"); then
+            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
+            spec=$(_parse_port_spec "")
         fi
+        h3_port="${spec%% *}"; h3_public="${spec##* }"
+        _info "H3 端口: $(_port_desc "$h3_port" "$h3_public")"
     fi
 
     local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
@@ -1703,7 +1781,8 @@ _custom_deploy() {
     fi
 
     _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
-        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id"
+        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id" \
+        "$reality_public" "$h3_public"
 }
 
 # 已部署 Reality/H3 后，单独补充/重建 Argo 隧道（自动建隧道 + DNS）
@@ -1927,9 +2006,11 @@ _show_status() {
     fi
 
     if [ -s "$META_FILE" ]; then
-        echo -e "  端口     : $(jq -r '[
-            (if (.reality_port // 0) > 0 then "Reality=\(.reality_port)" else empty end),
-            (if (.h3_port // 0) > 0 then "H3=\(.h3_port)" else empty end),
+        echo -e "  端口     : $(jq -r '
+            def fmt(l; pub): if ((pub // 0) == 0) or (pub == l) then "\(l)" else "\(l)→\(pub)" end;
+            [
+            (if (.reality_port // 0) > 0 then "Reality=" + fmt(.reality_port; .reality_public_port) else empty end),
+            (if (.h3_port // 0) > 0 then "H3=" + fmt(.h3_port; .h3_public_port) else empty end),
             (if (.argo_port // 0) > 0 and (.argo_token // "") != "" then "Argo=\(.argo_port)" else empty end)
         ] | join("  ")' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
@@ -2219,7 +2300,7 @@ _main_menu() {
         _show_status
 
         echo -e "  ${CYAN}【部署】${NC}" >&2
-        echo -e "    ${GREEN}[1]${NC} 一键部署 (Reality + H3，随机端口)" >&2
+        echo -e "    ${GREEN}[1]${NC} 一键部署 (Reality + H3，端口可选)" >&2
         echo -e "    ${GREEN}[2]${NC} 自定义部署 (可选协议/端口/Argo)" >&2
         echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (可单独创建，无需先装直连)" >&2
         echo "" >&2
