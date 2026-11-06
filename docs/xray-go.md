@@ -72,7 +72,7 @@ apk update && apk add curl bash
 
 ### 方式一：一键安装（推荐）
 
-安装管理命令 `xg`，安装完可直接进入菜单：
+安装管理命令 `xg`，安装完会显示数字菜单，输入数字直接执行：
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
@@ -80,9 +80,23 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install
 
 安装后：
 
+```
+1) 进入管理菜单（推荐）
+2) 一键部署 Reality + H3
+3) 查看节点链接
+4) 查看运行状态
+5) 卸载部署
+0) 退出
+```
+
+也可以直接带数字：
+
 ```bash
-xg          # 进入管理菜单
-xg deploy   # 一键部署（Reality + H3 随机端口）
+xg 1   # 管理菜单
+xg 2   # 一键部署（Reality + H3 随机端口）
+xg 3   # 查看节点链接
+xg 4   # 查看运行状态
+xg 5   # 卸载部署
 ```
 
 ### 方式二：全自动一键部署（免交互）
@@ -90,7 +104,7 @@ xg deploy   # 一键部署（Reality + H3 随机端口）
 装完即部署，部署完成后直接打印节点链接与 Base64 订阅：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh) deploy
+bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh) 2
 ```
 
 或直接执行主脚本：
@@ -109,6 +123,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 6. 自动放行 ufw / firewalld / iptables 端口
 7. 输出节点链接 + Base64 订阅，保存到 `/etc/xray/url.txt`
 
+> 部署过程中若没有 Argo 配置，会询问是否顺带用 Cloudflare 邮箱 + API Key 自动搭建 Argo 隧道。
+
 ### 方式三：自定义部署（可选协议）
 
 ```bash
@@ -117,24 +133,43 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 
 交互选择是否部署 Reality、H3、Argo，以及各自端口（回车自动随机）。
 
-### Argo 隧道（可选）
+### Argo 隧道：邮箱 + API Key 自动搭建（推荐）
 
-一键部署默认不启用 Argo（需要你自己的 Cloudflare Tunnel Token）。启用方式二选一：
+**不用去 Cloudflare 后台手动建隧道**，脚本用你的邮箱 + Global API Key 全自动完成：
 
-**A. 环境变量（免交互）**
+1. 校验凭据并读取账号下的 Zone / Account ID
+2. 创建命名隧道（隧道名取域名首段，如 `a.example.com` → `a`）
+3. 写入云端 ingress（`http://127.0.0.1:<端口>`）
+4. 自动创建 DNS CNAME → `<隧道ID>.cfargotunnel.com`（橙云代理）
+5. 取回隧道 Token 并启动 cloudflared
+
+入口三选一：
+
+```bash
+xg 1        # 菜单 → [3] Argo 自动搭建
+xg argo     # 直接执行
+```
+
+或在 `[1] 一键部署` / `[2] 自定义部署` 流程中按提示选择「自动搭建」。
+
+需要准备：
+
+| 项目 | 说明 |
+| :--- | :--- |
+| Cloudflare 邮箱 | 账号登录邮箱 |
+| Global API Key | CF 后台 → 我的个人资料 → API 令牌 → 查看 Global API Key |
+| 隧道域名 | 如 `a.example.com`，域名必须已托管在同一账号下 |
+
+凭据保存在 `/etc/xray/cf.json`（权限 600），下次自动复用。卸载时会自动删除云端隧道与 DNS 记录。
+
+**手动模式（已有 Token）**
 
 ```bash
 ARGO_TOKEN="你的Token" ARGO_DOMAIN="a.example.com" ARGO_PORT="8001" ARGO_PROTOCOL="http2" \
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go.sh) deploy
 ```
 
-**B. 菜单里交互填写**
-
-```bash
-xg   # 选择 [2] 自定义部署
-```
-
-> Cloudflare 后台需把该隧道的 Public Hostname 指向 `http://127.0.0.1:8001`（端口与 `ARGO_PORT` 保持一致）。
+> 手动模式下 Cloudflare 后台需把该隧道的 Public Hostname 指向 `http://127.0.0.1:8001`。
 > 协议选择建议：`http2` 默认 4 条连接，`quic` 默认 1 条连接，实测后择优。
 
 ### 兼容旧版参数写法
@@ -163,19 +198,21 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray-go
 | 选项 | 功能 |
 | :--- | :--- |
 | **[1] 一键部署** | Reality + H3，随机端口，全自动 |
-| **[2] 自定义部署** | 可选协议 / 端口 / Argo |
-| **[3] 查看节点链接** | 重新输出链接与 Base64 订阅 |
-| **[4] 服务控制** | 启动 / 停止 / 重启 / 重启 Argo / 状态 |
-| **[5] [6] 日志** | Xray 日志、Argo 日志实时查看 |
-| **[7] 检查配置** | `xray -test` 校验 `config.json` |
-| **[8] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
-| **[9] 更新脚本** | 从仓库拉取最新管理脚本 |
-| **[10] 卸载部署** | 停服务、删配置、清日志 |
+| **[2] 自定义部署** | 可选协议 / 端口 / Argo（自动或手动） |
+| **[3] Argo 自动搭建** | 已部署后补充/重建 Argo 隧道（CF 邮箱 + API Key） |
+| **[4] 查看节点链接** | 重新输出链接与 Base64 订阅 |
+| **[5] 服务控制** | 启动 / 停止 / 重启 / 重启 Argo / 状态 |
+| **[6] [7] 日志** | Xray 日志、Argo 日志实时查看 |
+| **[8] 检查配置** | `xray -test` 校验 `config.json` |
+| **[9] 更新核心** | 拉取 Xray-core 最新稳定版并热切换 |
+| **[10] 更新脚本** | 从仓库拉取最新管理脚本 |
+| **[11] 卸载部署** | 停服务、删配置、清日志、删云端隧道 |
 
 命令行等价用法：
 
 ```bash
-xg deploy | custom | links | status | start | stop | restart | log | check | update-core | update-script | uninstall
+xg 1..5                       # 数字快捷指令
+xg deploy | custom | argo | links | status | start | stop | restart | log | check | update-core | update-script | uninstall
 ```
 
 ---
@@ -186,7 +223,9 @@ xg deploy | custom | links | status | start | stop | restart | log | check | upd
 | :--- | :--- |
 | `/etc/xray/xray` | Xray-core 二进制 |
 | `/etc/xray/config.json` | 主配置（由 `meta.json` 生成） |
-| `/etc/xray/meta.json` | 部署元数据（UUID、端口、密钥、Argo 凭据，权限 600） |
+| `/etc/xray/meta.json` | 部署元数据（UUID、端口、密钥、Argo Token / 隧道 ID，权限 600） |
+| `/etc/xray/cf.json` | Cloudflare 邮箱 + Global API Key（权限 600） |
+| `/etc/xray/argo.env` | Argo 隧道 Token（systemd EnvironmentFile，权限 600） |
 | `/etc/xray/url.txt` | 节点链接（含明文凭据，权限 600） |
 | `/etc/xray/cert.pem` `private.key` | H3 自签证书 |
 | `/var/log/xray.log` | 运行日志 |
@@ -203,7 +242,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninsta
 或：
 
 ```bash
-xg uninstall
+xg 5
 ```
 
-卸载会停止并移除服务、删除 `/etc/xray`、`/run/xraygo` 与日志；管理命令 `xg` 会保留（如需删除：`rm -f /usr/local/bin/xg`）。
+卸载会停止并移除服务、删除 `/etc/xray`、`/run/xraygo` 与日志；若 Argo 是自动搭建的，还会一并删除 Cloudflare 云端隧道与 DNS 记录。管理命令 `xg` 会保留（如需删除：`rm -f /usr/local/bin/xg`）。

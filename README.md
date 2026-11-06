@@ -39,7 +39,7 @@ Cloudflare 需要**域名已托管**：
 
 - 版本 A：邮箱 + **Global API Key**
 - 版本 B：临时隧道零配置；固定隧道用同样的邮箱 + Global API Key（隧道 / DNS 全自动创建）
-- 版本 C：Argo 为可选项，需要 Cloudflare Tunnel 的 **Token + 域名**（也可只跑 Reality / H3 直连）
+- 版本 C：Argo 同样支持**邮箱 + Global API Key 全自动搭建**（建隧道 / ingress / DNS 一次搞定）
 
 ---
 
@@ -67,18 +67,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_
 bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
 ```
 
-安装后：
+安装完直接显示数字菜单，输入数字即可执行：
 
-```bash
-xg          # 管理菜单
-xg deploy   # 一键部署（Reality + H3 随机端口，全自动）
 ```
+1) 进入管理菜单（推荐）
+2) 一键部署 Reality + H3
+3) 查看节点链接
+4) 查看运行状态
+5) 卸载部署
+0) 退出
+```
+
+也可以直接带数字：`xg 1` ~ `xg 5`。
 
 **特点**
 
 - **XHTTP H3 直连**：HTTP/3 标准 UDP 传输，低延迟高吞吐，不易被运营商 QoS
 - **XHTTP-Argo 双模隧道**：隧道跑 quic 时全段 UDP，隐藏真实 IP、零端口暴露
 - **VLESS-TCP-REALITY Vision**：无需域名，伪装 TLS，免疫主动探测
+- **Argo 全自动搭建**：填 Cloudflare 邮箱 + Global API Key，脚本自动建隧道、写 ingress、建 DNS CNAME、取 Token、启动 cloudflared，卸载时自动删云端资源
 - 自动装依赖 → 装核心（SHA-256 校验）→ 生成配置 → 托管服务（systemd / openrc / direct）→ 放行端口 → 输出链接与 Base64 订阅
 - 菜单化管理：查看链接、服务控制、日志、配置校验、更新核心、卸载
 
@@ -92,4 +99,4 @@ xg deploy   # 一键部署（Reality + H3 随机端口，全自动）
 | :--- | :--- |
 | A | 运行 `x` → 菜单内卸载 |
 | B | 运行 `sb` → 菜单内卸载 |
-| C | `xg uninstall`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)` |
+| C | `xg 5`，或 `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/uninstall.sh)` |

@@ -27,6 +27,9 @@ XRAY_BIN="${XRAY_DIR}/xray"
 CLOUDFLARED_BIN="${XRAY_DIR}/cloudflared"
 PID_FILE="${RUNTIME_DIR}/xray.pid"
 ARGO_PID_FILE="${RUNTIME_DIR}/cloudflared.pid"
+META_FILE="${XRAY_DIR}/meta.json"
+CF_CRED_FILE="${XRAY_DIR}/cf.json"
+CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     _error "请以 root 权限运行。"
@@ -55,6 +58,60 @@ _stop_direct() {
         _is_pid_running_cmd "$pid" "$pattern" && kill -9 "$pid" 2>/dev/null
     fi
     rm -f "$pid_file"
+    return 0
+}
+
+# 删除由脚本自动创建的 Cloudflare 隧道与 DNS 记录（需要在删文件之前执行）
+_cleanup_cloud() {
+    [ -s "$META_FILE" ] || return 0
+    local tid zid domain email key acct resp
+
+    tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
+    [ -n "$tid" ] || return 0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        _warn "未安装 jq，跳过云端隧道清理（隧道: ${tid}）。"
+        return 0
+    fi
+    if [ ! -s "$CF_CRED_FILE" ]; then
+        _warn "未找到 Cloudflare 凭据，跳过云端清理（隧道: ${tid}），请手动在控制台删除。"
+        return 0
+    fi
+
+    email=$(jq -r '.email // ""' "$CF_CRED_FILE" 2>/dev/null)
+    key=$(jq -r '.api_key // ""' "$CF_CRED_FILE" 2>/dev/null)
+    acct=$(jq -r '.account_id // ""' "$CF_CRED_FILE" 2>/dev/null)
+    zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
+    domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
+
+    if [ -z "$email" ] || [ -z "$key" ] || [ -z "$acct" ]; then
+        _warn "Cloudflare 凭据不完整，跳过云端清理（隧道: ${tid}）。"
+        return 0
+    fi
+
+    _info "正在删除 Cloudflare 云端隧道 (${tid})..."
+    resp=$(curl -sS --connect-timeout 10 --max-time 30 -X DELETE \
+        -H "X-Auth-Email: ${email}" -H "X-Auth-Key: ${key}" \
+        "${CF_API_BASE}/accounts/${acct}/cfd_tunnel/${tid}?cascade=true" 2>/dev/null || true)
+    if printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+        _success "云端隧道已删除。"
+    else
+        _warn "云端隧道删除失败，请手动在 Cloudflare 控制台清理。"
+    fi
+
+    if [ -n "$zid" ] && [ -n "$domain" ]; then
+        local rids rid
+        rids=$(curl -sS --connect-timeout 10 --max-time 30 \
+            -H "X-Auth-Email: ${email}" -H "X-Auth-Key: ${key}" \
+            "${CF_API_BASE}/zones/${zid}/dns_records?name=${domain}" 2>/dev/null \
+            | jq -r '.result[]?.id // empty' 2>/dev/null)
+        for rid in $rids; do
+            curl -sS --connect-timeout 10 --max-time 30 -X DELETE \
+                -H "X-Auth-Email: ${email}" -H "X-Auth-Key: ${key}" \
+                "${CF_API_BASE}/zones/${zid}/dns_records/${rid}" >/dev/null 2>&1 || true
+        done
+        _success "DNS 记录已清理 (${domain})。"
+    fi
     return 0
 }
 
@@ -104,7 +161,10 @@ _info "正在清理残留进程..."
 _stop_direct "$ARGO_PID_FILE" "$CLOUDFLARED_BIN"
 _stop_direct "$PID_FILE" "$XRAY_BIN"
 
-# 4. 删除文件
+# 4. 清理云端隧道（必须在删除 /etc/xray 之前）
+_cleanup_cloud
+
+# 5. 删除文件
 _info "正在删除配置与日志..."
 rm -rf "$XRAY_DIR" "$RUNTIME_DIR"
 rm -f "$LOG_FILE" "$ARGO_LOG_FILE"

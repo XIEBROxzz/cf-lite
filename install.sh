@@ -5,11 +5,11 @@
 #
 #  用法：
 #    bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
-#         -> 安装管理命令 xg，然后询问是否立即部署
-#    bash <(curl -Ls .../install.sh) deploy
+#         -> 安装管理命令 xg，显示 1-5 数字菜单，输入数字直接执行
+#    bash <(curl -Ls .../install.sh) 2
 #         -> 安装后直接一键部署（全自动，无需交互）
-#    bash <(curl -Ls .../install.sh) -y
-#         -> 安装后直接一键部署（同上）
+#    bash <(curl -Ls .../install.sh) 1
+#         -> 安装后直接进入管理菜单
 # ==============================================================================
 
 export LANG=en_US.UTF-8
@@ -113,30 +113,44 @@ if ! mv -f "$_stage" "$TARGET_BIN"; then
 fi
 _success "管理命令已安装: ${TARGET_BIN}"
 
-# 4. 是否立即部署
+# 4. 带参数时直接执行
 case "${1:-}" in
-    deploy | -y | --yes | install)
+    deploy | -y | --yes | install | 2)
         _info "开始一键部署..."
         exec "$TARGET_BIN" deploy
+        ;;
+    1 | 3 | 4 | 5)
+        exec "$TARGET_BIN" "$1"
         ;;
 esac
 
 echo "" >&2
-echo -e "  常用命令：" >&2
-echo -e "    ${GREEN}xg${NC}              进入管理菜单（推荐）" >&2
-echo -e "    ${GREEN}xg deploy${NC}       一键部署 Reality + H3" >&2
-echo -e "    ${GREEN}xg links${NC}        查看节点链接" >&2
-echo -e "    ${GREEN}xg status${NC}       查看运行状态" >&2
-echo -e "    ${GREEN}xg uninstall${NC}    卸载部署" >&2
+echo -e "  ${CYAN}快捷指令：${NC}" >&2
+echo -e "    ${GREEN}1${NC}) 进入管理菜单（推荐）" >&2
+echo -e "    ${GREEN}2${NC}) 一键部署 Reality + H3" >&2
+echo -e "    ${GREEN}3${NC}) 查看节点链接" >&2
+echo -e "    ${GREEN}4${NC}) 查看运行状态" >&2
+echo -e "    ${GREEN}5${NC}) 卸载部署" >&2
+echo -e "    ${YELLOW}0${NC}) 退出" >&2
 echo "" >&2
 
 if [ -t 0 ]; then
-    read -r -p "是否立即执行一键部署? (Y/n): " answer || answer=""
-    answer="${answer:-y}"
-    if [[ "${answer,,}" =~ ^(y|yes)$ ]]; then
-        exec "$TARGET_BIN" deploy
-    fi
-    _info "已跳过部署，可稍后运行: xg deploy"
+    read -r -p "  请输入数字直接执行 [0-5]（回车进入菜单）: " answer || answer=""
+    case "$answer" in
+        1 | 2 | 3 | 4 | 5)
+            exec "$TARGET_BIN" "$answer"
+            ;;
+        "" )
+            exec "$TARGET_BIN" 1
+            ;;
+        0)
+            _info "已退出，可稍后执行: xg"
+            exit 0
+            ;;
+        *)
+            _warn "无效输入，可稍后执行: xg"
+            ;;
+    esac
 else
-    _info "非交互环境，可手动执行: xg deploy"
+    _info "非交互环境，可手动执行: xg 1（菜单）/ xg 2（一键部署）"
 fi

@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 # 配置、元数据、私钥仅 root 可读写
 umask 077
 
-export SCRIPT_VERSION="2.0.0"
+export SCRIPT_VERSION="2.1.0"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
 # Github Cloudflare 安全代理（优先直连官方，失败后轮询代理）
@@ -30,6 +30,18 @@ KEY_FILE="${XRAY_DIR}/private.key"
 CLOUDFLARED_BIN="${XRAY_DIR}/cloudflared"
 ARGO_ENV_FILE="${XRAY_DIR}/argo.env"
 DEP_STATE_FILE="${XRAY_DIR}/dependencies.ok"
+CF_CRED_FILE="${XRAY_DIR}/cf.json"
+CF_API_BASE="https://api.cloudflare.com/client/v4"
+CF_EMAIL=""
+CF_KEY=""
+CF_ACCOUNT_ID=""
+# 保留环境变量传入的值（支持 ARGO_TOKEN=xxx xg deploy 这种用法）
+ARGO_TOKEN="${ARGO_TOKEN:-}"
+ARGO_DOMAIN="${ARGO_DOMAIN:-}"
+ARGO_PORT="${ARGO_PORT:-8001}"
+ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
+ARGO_TUNNEL_ID="${ARGO_TUNNEL_ID:-}"
+ARGO_ZONE_ID="${ARGO_ZONE_ID:-}"
 DEP_STATE_VERSION="20261106-1"
 LOG_FILE="/var/log/xray.log"
 ARGO_LOG_FILE="/var/log/xray-argo.log"
@@ -142,7 +154,7 @@ _secure_permissions() {
     [ -d "$RUNTIME_DIR" ] && chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
     local f
     for f in "$CONFIG_FILE" "$META_FILE" "$LINKS_FILE" "$KEY_FILE" "$ARGO_ENV_FILE" \
-             "$CERT_FILE" "$DEP_STATE_FILE" "$SERVICE_FILE" "$ARGO_SERVICE_FILE"; do
+             "$CERT_FILE" "$DEP_STATE_FILE" "$CF_CRED_FILE" "$SERVICE_FILE" "$ARGO_SERVICE_FILE"; do
         [ -f "$f" ] && chmod 600 "$f" 2>/dev/null || true
     done
     return 0
@@ -953,6 +965,274 @@ _stop_all_services() {
 }
 
 # ==============================================================================
+#  Cloudflare API：邮箱 + Global API Key 自动搭建 Argo 固定隧道
+#  自动完成：创建命名隧道 -> 写入 ingress -> 创建 DNS CNAME(proxied) -> 取回 Token
+#  卸载时自动删除云端隧道与 DNS 记录
+# ==============================================================================
+
+_cf_load_cred() {
+    [ -s "$CF_CRED_FILE" ] || return 1
+    CF_EMAIL=$(jq -r '.email // ""' "$CF_CRED_FILE" 2>/dev/null)
+    CF_KEY=$(jq -r '.api_key // ""' "$CF_CRED_FILE" 2>/dev/null)
+    CF_ACCOUNT_ID=$(jq -r '.account_id // ""' "$CF_CRED_FILE" 2>/dev/null)
+    [ -n "$CF_EMAIL" ] && [ -n "$CF_KEY" ]
+}
+
+_cf_save_cred() {
+    mkdir -p "$XRAY_DIR" 2>/dev/null || return 1
+    local tmp
+    tmp=$(mktemp "${CF_CRED_FILE}.tmp.XXXXXX") || return 1
+    if ! jq -n --arg e "$CF_EMAIL" --arg k "$CF_KEY" --arg a "$CF_ACCOUNT_ID" \
+        '{email: $e, api_key: $k, account_id: $a}' > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$CF_CRED_FILE" || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+_cf_verify() {
+    local r
+    r=$(curl -sS --connect-timeout 10 --max-time 30 \
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY" \
+        "${CF_API_BASE}/zones?per_page=1" 2>/dev/null || true)
+    printf '%s' "$r" | jq -e '.success == true' >/dev/null 2>&1
+}
+
+# 统一 CF API 调用；成功时把原始 JSON 输出到 stdout
+_cf_call() {
+    local method="$1" endpoint="$2" data="${3:-}" resp msg
+    local args=(curl -sS --connect-timeout 10 --max-time 40 -X "$method"
+        -H "X-Auth-Email: $CF_EMAIL" -H "X-Auth-Key: $CF_KEY"
+        -H "Content-Type: application/json")
+    [ -n "$data" ] && args+=(-d "$data")
+    resp=$("${args[@]}" "${CF_API_BASE}${endpoint}" 2>/dev/null) || true
+
+    if ! printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+        msg=$(printf '%s' "$resp" | jq -r '[.errors[]?.message] | join("; ")' 2>/dev/null)
+        _error "Cloudflare API 失败 [${method} ${endpoint}]: ${msg:-无响应或网络错误}"
+        return 1
+    fi
+    printf '%s' "$resp"
+}
+
+_cf_prompt_cred() {
+    if _cf_load_cred; then
+        local masked="${CF_KEY:0:6}...${CF_KEY: -4}"
+        if _ask_yes "  检测到已保存的 Cloudflare 凭据 (${CF_EMAIL} / ${masked})，直接复用? (Y/n): " y; then
+            if _cf_verify; then
+                _success "Cloudflare 凭据校验通过。"
+                return 0
+            fi
+            _warn "已保存的凭据校验失败，请重新输入。"
+        fi
+    fi
+
+    local email key
+    while true; do
+        read -r -p "  Cloudflare 邮箱: " email || return 1
+        read -r -s -p "  Global API Key (输入不回显): " key || return 1
+        echo "" >&2
+        email=$(printf '%s' "$email" | tr -d '[:space:]')
+        key=$(printf '%s' "$key" | tr -d '[:space:]')
+        if [ -z "$email" ] || [ -z "$key" ]; then
+            _warn "邮箱与 API Key 不能为空，请重新输入。"
+            continue
+        fi
+        CF_EMAIL="$email"
+        CF_KEY="$key"
+        _info "正在校验 Cloudflare 凭据..."
+        if _cf_verify; then
+            _success "Cloudflare 凭据校验通过。"
+            _cf_save_cred || _warn "凭据保存失败，本次部署仍可继续。"
+            return 0
+        fi
+        _error "凭据校验失败（邮箱/Key 错误，或账号未开通 API），请重新输入，Ctrl+C 退出。"
+    done
+}
+
+# 域名 -> "zone_id account_id"（取最长后缀匹配的 Zone）
+_cf_find_zone() {
+    local domain="$1" zones zn zi za best="" best_id="" best_acct=""
+    zones=$(_cf_call GET "/zones?per_page=100") || return 1
+    while read -r zn zi za; do
+        [ -n "$zn" ] || continue
+        if [ "$domain" = "$zn" ] || [[ "$domain" == *".${zn}" ]]; then
+            if [ "${#zn}" -gt "${#best}" ]; then
+                best="$zn"; best_id="$zi"; best_acct="$za"
+            fi
+        fi
+    done < <(printf '%s' "$zones" | jq -r '.result[]? | "\(.name) \(.id) \(.account.id)"' 2>/dev/null)
+    if [ -z "$best_id" ]; then
+        _error "在 Cloudflare 账号中找不到 ${domain} 所属 Zone（请确认域名已托管在该账号）。"
+        return 1
+    fi
+    printf '%s %s\n' "$best_id" "$best_acct"
+}
+
+_argo_tunnel_name() {
+    local d name
+    d="${1%%.*}"
+    name=$(printf '%s' "$d" | tr -cd 'a-zA-Z0-9-_')
+    [ -n "$name" ] || name="xraygo-$(_rand_port)"
+    printf '%s' "$name"
+}
+
+# 创建命名隧道 -> "tunnel_id token"
+_cf_create_tunnel() {
+    local name="$1" resp tid token
+    resp=$(_cf_call POST "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+        "$(jq -n --arg n "$name" '{name: $n, config_src: "cloudflare"}')") || return 1
+    tid=$(printf '%s' "$resp" | jq -r '.result.id // ""' 2>/dev/null)
+    token=$(printf '%s' "$resp" | jq -r '.result.token // ""' 2>/dev/null)
+    if [ -z "$tid" ]; then
+        _error "创建隧道失败：接口未返回 tunnel id。"
+        return 1
+    fi
+    if [ -z "$token" ]; then
+        token=$(_cf_call GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tid}/token" 2>/dev/null \
+            | jq -r '.result // ""' 2>/dev/null)
+    fi
+    if [ -z "$token" ]; then
+        _error "获取隧道 Token 失败（隧道 ${tid} 已创建，可稍后重试）。"
+        return 1
+    fi
+    printf '%s %s\n' "$tid" "$token"
+}
+
+_cf_set_ingress() {
+    local tid="$1" domain="$2" port="$3"
+    _cf_call PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tid}/configurations" \
+        "$(jq -n --arg h "$domain" --arg p "$port" \
+            '{config: {ingress: [{hostname: $h, service: ("http://127.0.0.1:" + $p)}, {service: "http_status:404"}]}}')" >/dev/null
+}
+
+_cf_ensure_dns() {
+    local zone_id="$1" domain="$2" tid="$3" target rec rid content
+    target="${tid}.cfargotunnel.com"
+    rec=$(_cf_call GET "/zones/${zone_id}/dns_records?name=${domain}") || return 1
+    rid=$(printf '%s' "$rec" | jq -r '.result[0].id // ""' 2>/dev/null)
+    content=$(printf '%s' "$rec" | jq -r '.result[0].content // ""' 2>/dev/null)
+    if [ -n "$rid" ] && [ "$content" = "$target" ]; then
+        _info "DNS 记录已存在且指向正确: ${domain} -> ${target}"
+        return 0
+    fi
+    if [ -n "$rid" ]; then
+        _info "删除旧的 DNS 记录 (${content})..."
+        _cf_call DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null || true
+    fi
+    _cf_call POST "/zones/${zone_id}/dns_records" \
+        "$(jq -n --arg n "$domain" --arg c "$target" \
+            '{type: "CNAME", name: $n, content: $c, proxied: true, ttl: 1}')" >/dev/null
+}
+
+_cf_delete_tunnel() {
+    local tid="$1"
+    [ -n "$tid" ] || return 0
+    _cf_call DELETE "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tid}?cascade=true" >/dev/null
+}
+
+_cf_delete_dns() {
+    local zone_id="$1" domain="$2" rids rid
+    [ -n "$zone_id" ] && [ -n "$domain" ] || return 0
+    rids=$(_cf_call GET "/zones/${zone_id}/dns_records?name=${domain}" 2>/dev/null \
+        | jq -r '.result[]?.id // empty' 2>/dev/null)
+    for rid in $rids; do
+        _cf_call DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
+    done
+    return 0
+}
+
+# 自动搭建主流程：成功时写入 ARGO_* 全局变量
+_argo_auto_setup() {
+    ARGO_TOKEN=""
+    ARGO_DOMAIN=""
+    ARGO_PORT="8001"
+    ARGO_PROTOCOL="http2"
+    ARGO_TUNNEL_ID=""
+    ARGO_ZONE_ID=""
+
+    _info "=== Cloudflare 自动搭建 Argo 隧道 ==="
+    _cf_prompt_cred || return 1
+
+    local domain port proto out zone acct
+    read -r -p "  Argo 隧道域名（如 a.example.com，需已托管在 CF）: " domain || return 1
+    domain=$(printf '%s' "$domain" | tr -d '[:space:]')
+    if [ -z "$domain" ] || [[ "$domain" != *.* ]]; then
+        _error "域名格式不正确，应为 a.example.com 这类完整主机名。"
+        return 1
+    fi
+
+    read -r -p "  Argo 本地端口（回车 8001，需与 ingress 一致）: " port || port=""
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || port="8001"
+
+    read -r -p "  隧道协议 [http2/quic]（回车 http2）: " proto || proto=""
+    case "${proto,,}" in
+        quic) proto="quic" ;;
+        *) proto="http2" ;;
+    esac
+
+    _info "正在查询 ${domain} 所属 Zone..."
+    out=$(_cf_find_zone "$domain") || return 1
+    read -r zone acct <<< "$out"
+    [ -n "$acct" ] && CF_ACCOUNT_ID="$acct"
+    [ -n "$CF_ACCOUNT_ID" ] || { _error "未获取到 Cloudflare Account ID。"; return 1; }
+    _cf_save_cred >/dev/null 2>&1 || true
+
+    local tname tid token
+    tname=$(_argo_tunnel_name "$domain")
+    _info "正在创建命名隧道: ${tname} ..."
+    out=$(_cf_create_tunnel "$tname") || return 1
+    read -r tid token <<< "$out"
+    [ -n "$tid" ] && [ -n "$token" ] || { _error "隧道创建结果异常。"; return 1; }
+    _success "隧道已创建: ${tid}"
+
+    _info "正在写入 ingress 规则 (http://127.0.0.1:${port})..."
+    if _cf_set_ingress "$tid" "$domain" "$port"; then
+        _success "ingress 规则已写入。"
+    else
+        _warn "ingress 写入失败，可在 CF 控制台手动添加 Public Hostname。"
+    fi
+
+    _info "正在创建 DNS CNAME ..."
+    if _cf_ensure_dns "$zone" "$domain" "$tid"; then
+        _success "DNS 解析已就绪: ${domain} -> ${tid}.cfargotunnel.com"
+    else
+        _warn "DNS 自动创建失败，请手动添加 CNAME 到 ${tid}.cfargotunnel.com（橙云）。"
+    fi
+
+    ARGO_TOKEN="$token"
+    ARGO_DOMAIN="$domain"
+    ARGO_PORT="$port"
+    ARGO_PROTOCOL="$proto"
+    ARGO_TUNNEL_ID="$tid"
+    ARGO_ZONE_ID="$zone"
+    return 0
+}
+
+# 清理云端资源（卸载时调用）
+_argo_auto_cleanup() {
+    local tid="$1" zid="$2" domain="$3"
+    [ -n "$tid" ] || return 0
+    if ! _cf_load_cred; then
+        _warn "未找到 Cloudflare 凭据，跳过云端清理（隧道: ${tid}），请手动在控制台删除。"
+        return 0
+    fi
+    _info "正在删除 Cloudflare 云端隧道 (${tid})..."
+    if _cf_delete_tunnel "$tid"; then
+        _success "云端隧道已删除。"
+    else
+        _warn "云端隧道删除失败，请手动清理。"
+    fi
+    if [ -n "$zid" ] && [ -n "$domain" ]; then
+        _info "正在删除 DNS 记录 (${domain})..."
+        _cf_delete_dns "$zid" "$domain" && _success "DNS 记录已删除。"
+    fi
+    return 0
+}
+
+# ==============================================================================
 #  防火墙
 # ==============================================================================
 
@@ -1079,6 +1359,7 @@ _show_links() {
 
 _deploy_all() {
     local reality_port="$1" h3_port="$2" argo_protocol="$3" argo_port="$4" argo_domain="$5" argo_token="$6"
+    local argo_tunnel_id="${7:-}" argo_zone_id="${8:-}"
 
     _check_root
     _detect_init_system
@@ -1153,6 +1434,8 @@ _deploy_all() {
         --arg argo_domain "$argo_domain" \
         --arg argo_protocol "$argo_protocol" \
         --arg argo_token "$argo_token" \
+        --arg argo_tunnel_id "$argo_tunnel_id" \
+        --arg argo_zone_id "$argo_zone_id" \
         --arg server_ip "$server_ip" \
         --arg created_at "$(date '+%Y-%m-%d %H:%M:%S')" \
         '{
@@ -1169,6 +1452,8 @@ _deploy_all() {
             argo_domain: $argo_domain,
             argo_protocol: $argo_protocol,
             argo_token: $argo_token,
+            argo_tunnel_id: $argo_tunnel_id,
+            argo_zone_id: $argo_zone_id,
             server_ip: $server_ip,
             created_at: $created_at
         }' > "$meta_tmp"; then
@@ -1245,16 +1530,39 @@ _one_click_deploy() {
 
     # 已存在的 Argo 配置在重部署时沿用，避免掉线
     local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
+    local argo_tunnel_id="" argo_zone_id=""
     if [ -s "$META_FILE" ]; then
         argo_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
         argo_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
         argo_protocol=$(jq -r '.argo_protocol // "http2"' "$META_FILE" 2>/dev/null)
         argo_port=$(jq -r '.argo_port // 0' "$META_FILE" 2>/dev/null)
+        argo_tunnel_id=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
+        argo_zone_id=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
     fi
     [ -n "${ARGO_TOKEN:-}" ] && argo_token="$ARGO_TOKEN"
     [ -n "${ARGO_DOMAIN:-}" ] && argo_domain="$ARGO_DOMAIN"
     [ -n "${ARGO_PROTOCOL:-}" ] && argo_protocol="$ARGO_PROTOCOL"
     [ -n "${ARGO_PORT:-}" ] && argo_port="$ARGO_PORT"
+
+    # 无 Argo 配置时，交互询问是否用 CF 凭据自动搭建
+    if [ -z "$argo_token" ] && [ -t 0 ]; then
+        echo "" >&2
+        if _ask_yes "  是否顺带自动搭建 Argo 隧道（用 Cloudflare 邮箱 + API Key）? (y/N): " n; then
+            if _argo_auto_setup; then
+                argo_token="$ARGO_TOKEN"
+                argo_domain="$ARGO_DOMAIN"
+                argo_protocol="$ARGO_PROTOCOL"
+                argo_port="$ARGO_PORT"
+                argo_tunnel_id="$ARGO_TUNNEL_ID"
+                argo_zone_id="$ARGO_ZONE_ID"
+            else
+                _warn "Argo 自动搭建未完成，本次只部署 Reality + H3。"
+                argo_token=""
+                argo_domain=""
+                argo_port="0"
+            fi
+        fi
+    fi
 
     echo "" >&2
     echo -e "${CYAN}  一键部署预览${NC}" >&2
@@ -1263,11 +1571,12 @@ _one_click_deploy() {
     if [ -n "$argo_token" ]; then
         echo -e "    XHTTP-Argo 隧道          : ${argo_protocol} / ${argo_domain}" >&2
     else
-        echo -e "    XHTTP-Argo 隧道          : ${YELLOW}未启用（需 ARGO_TOKEN/ARGO_DOMAIN）${NC}" >&2
+        echo -e "    XHTTP-Argo 隧道          : ${YELLOW}未启用${NC}" >&2
     fi
     echo "" >&2
 
-    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" "$argo_domain" "$argo_token"
+    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
+        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id"
 }
 
 _custom_deploy() {
@@ -1301,32 +1610,56 @@ _custom_deploy() {
     fi
 
     local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
-    if _ask_yes "  是否部署 XHTTP-Argo 隧道 (需 Cloudflare Tunnel Token)? (y/N): " n; then
-        read -r -p "  Argo 本地端口 (回车 8001): " input || input=""
-        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
-            argo_port="$input"
-        else
-            argo_port="8001"
-        fi
+    local argo_tunnel_id="" argo_zone_id=""
+    if _ask_yes "  是否部署 XHTTP-Argo 隧道? (y/N): " n; then
+        echo "" >&2
+        echo -e "    ${GREEN}[1]${NC} 自动搭建（Cloudflare 邮箱 + Global API Key，推荐）" >&2
+        echo -e "    ${GREEN}[2]${NC} 手动填写（已有 Tunnel Token + 域名）" >&2
+        read -r -p "  请选择 [1/2] (回车 1): " input || input=""
+        case "$input" in
+            2)
+                read -r -p "  Argo 本地端口 (回车 8001): " input || input=""
+                if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
+                    argo_port="$input"
+                else
+                    argo_port="8001"
+                fi
 
-        read -r -p "  Argo 隧道协议 [http2/quic] (回车 http2): " input || input=""
-        case "${input,,}" in
-            quic) argo_protocol="quic" ;;
-            *) argo_protocol="http2" ;;
+                read -r -p "  Argo 隧道协议 [http2/quic] (回车 http2): " input || input=""
+                case "${input,,}" in
+                    quic) argo_protocol="quic" ;;
+                    *) argo_protocol="http2" ;;
+                esac
+
+                read -r -p "  Cloudflare Tunnel 完整域名 (如 a.example.com): " argo_domain || argo_domain=""
+                argo_domain=$(printf '%s' "$argo_domain" | tr -d '[:space:]')
+
+                read -r -p "  Cloudflare Tunnel Token: " argo_token || argo_token=""
+                argo_token=$(printf '%s' "$argo_token" | tr -d '[:space:]')
+
+                if [ -z "$argo_domain" ] || [ -z "$argo_token" ]; then
+                    _warn "域名或 Token 为空，已跳过 Argo 部署。"
+                    argo_token=""
+                    argo_domain=""
+                    argo_port="0"
+                fi
+                ;;
+            *)
+                if _argo_auto_setup; then
+                    argo_token="$ARGO_TOKEN"
+                    argo_domain="$ARGO_DOMAIN"
+                    argo_protocol="$ARGO_PROTOCOL"
+                    argo_port="$ARGO_PORT"
+                    argo_tunnel_id="$ARGO_TUNNEL_ID"
+                    argo_zone_id="$ARGO_ZONE_ID"
+                else
+                    _warn "Argo 自动搭建未完成，已跳过。"
+                    argo_token=""
+                    argo_domain=""
+                    argo_port="0"
+                fi
+                ;;
         esac
-
-        read -r -p "  Cloudflare Tunnel 完整域名 (如 a.example.com): " argo_domain || argo_domain=""
-        argo_domain=$(printf '%s' "$argo_domain" | tr -d '[:space:]')
-
-        read -r -p "  Cloudflare Tunnel Token: " argo_token || argo_token=""
-        argo_token=$(printf '%s' "$argo_token" | tr -d '[:space:]')
-
-        if [ -z "$argo_domain" ] || [ -z "$argo_token" ]; then
-            _warn "域名或 Token 为空，已跳过 Argo 部署。"
-            argo_token=""
-            argo_domain=""
-            argo_port="0"
-        fi
     fi
 
     if [ "$reality_port" = "0" ] && [ "$h3_port" = "0" ] && [ -z "$argo_token" ]; then
@@ -1334,7 +1667,56 @@ _custom_deploy() {
         return 1
     fi
 
-    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" "$argo_domain" "$argo_token"
+    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
+        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id"
+}
+
+# 已部署 Reality/H3 后，单独补充/重建 Argo 隧道（自动建隧道 + DNS）
+_add_argo_only() {
+    _check_root
+    _detect_init_system
+
+    if [ ! -s "$META_FILE" ]; then
+        _error "尚未部署基础协议，请先执行 [1] 一键部署。"
+        return 1
+    fi
+
+    _install_dependencies || return 1
+    _install_xray_core auto || return 1
+    _install_cloudflared || return 1
+
+    _argo_auto_setup || return 1
+
+    local tmp
+    tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
+    if ! jq --arg t "$ARGO_TOKEN" --arg d "$ARGO_DOMAIN" --arg p "$ARGO_PROTOCOL" \
+        --argjson port "$ARGO_PORT" --arg tid "$ARGO_TUNNEL_ID" --arg zid "$ARGO_ZONE_ID" '
+        .argo_token = $t
+        | .argo_domain = $d
+        | .argo_protocol = $p
+        | .argo_port = $port
+        | .argo_tunnel_id = $tid
+        | .argo_zone_id = $zid
+        | .argo_path = (if (.argo_path // "") == "" then ((.uuid // "argo") + "-argo") else .argo_path end)
+    ' "$META_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        _error "更新 meta.json 失败。"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
+
+    _write_config || return 1
+    _check_config || return 1
+    _manage_service restart || return 1
+    if ! _setup_argo "$ARGO_TOKEN" "$ARGO_PROTOCOL"; then
+        _error "Argo 隧道启动失败，请检查 cloudflared 日志。"
+        return 1
+    fi
+
+    _success "Argo 隧道已就绪: ${ARGO_DOMAIN}"
+    _show_links
+    return 0
 }
 
 # ==============================================================================
@@ -1457,12 +1839,22 @@ _uninstall_deploy() {
     _check_root
     _detect_init_system
 
+    local cloud_tid="" cloud_zid="" cloud_domain=""
+    if [ -s "$META_FILE" ]; then
+        cloud_tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
+        cloud_zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
+        cloud_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
+    fi
+
     echo "" >&2
     echo -e "${RED}  即将删除以下内容：${NC}" >&2
     echo -e "    - Xray 服务与 Argo 隧道服务" >&2
-    echo -e "    - 配置目录: ${XRAY_DIR}（含配置、证书、密钥、cloudflared）" >&2
+    echo -e "    - 配置目录: ${XRAY_DIR}（含配置、证书、密钥、cloudflared、CF 凭据）" >&2
     echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
     echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
+    if [ -n "$cloud_tid" ]; then
+        echo -e "    - ${YELLOW}Cloudflare 云端隧道 ${cloud_tid} 及其 DNS 记录${NC}" >&2
+    fi
     echo "" >&2
 
     if ! _ask_yes "  确认卸载 Xray-go? (y/N): " n; then
@@ -1472,6 +1864,11 @@ _uninstall_deploy() {
 
     _info "正在停止服务..."
     _stop_all_services
+
+    # 先清理云端（需要在删除凭据文件之前完成）
+    if [ -n "$cloud_tid" ]; then
+        _argo_auto_cleanup "$cloud_tid" "$cloud_zid" "$cloud_domain"
+    fi
 
     case "$INIT_SYSTEM" in
         systemd)
@@ -1639,36 +2036,38 @@ _main_menu() {
         echo -e "  ${CYAN}【部署】${NC}" >&2
         echo -e "    ${GREEN}[1]${NC} 一键部署 (Reality + H3，随机端口)" >&2
         echo -e "    ${GREEN}[2]${NC} 自定义部署 (可选协议/端口/Argo)" >&2
+        echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (CF 邮箱 + API Key)" >&2
         echo "" >&2
         echo -e "  ${CYAN}【管理】${NC}" >&2
-        echo -e "    ${GREEN}[3]${NC} 查看节点链接" >&2
-        echo -e "    ${GREEN}[4]${NC} 服务控制" >&2
-        echo -e "    ${GREEN}[5]${NC} 查看实时日志" >&2
-        echo -e "    ${GREEN}[6]${NC} 查看 Argo 日志" >&2
-        echo -e "    ${GREEN}[7]${NC} 检查配置文件" >&2
+        echo -e "    ${GREEN}[4]${NC} 查看节点链接" >&2
+        echo -e "    ${GREEN}[5]${NC} 服务控制" >&2
+        echo -e "    ${GREEN}[6]${NC} 查看实时日志" >&2
+        echo -e "    ${GREEN}[7]${NC} 查看 Argo 日志" >&2
+        echo -e "    ${GREEN}[8]${NC} 检查配置文件" >&2
         echo "" >&2
         echo -e "  ${CYAN}【维护】${NC}" >&2
-        echo -e "    ${GREEN}[8]${NC} 更新 Xray 核心" >&2
-        echo -e "    ${GREEN}[9]${NC} 更新脚本" >&2
-        echo -e "    ${RED}[10]${NC} 卸载部署" >&2
+        echo -e "    ${GREEN}[9]${NC} 更新 Xray 核心" >&2
+        echo -e "    ${GREEN}[10]${NC} 更新脚本" >&2
+        echo -e "    ${RED}[11]${NC} 卸载部署" >&2
         echo "" >&2
         echo -e "  ───────────────────────────────────────────" >&2
         echo -e "    ${YELLOW}[0]${NC} 退出" >&2
         echo "" >&2
 
         local choice=""
-        read -r -p "  请输入选项 [0-10]: " choice || return 0
+        read -r -p "  请输入选项 [0-11]: " choice || return 0
         case "$choice" in
             1) _one_click_deploy ;;
             2) _custom_deploy ;;
-            3) _show_links ;;
-            4) _service_menu ;;
-            5) _view_log ;;
-            6) _view_argo_log ;;
-            7) _check_config ;;
-            8) _update_core ;;
-            9) _update_script && exit 0 ;;
-            10) _uninstall_deploy ;;
+            3) _add_argo_only ;;
+            4) _show_links ;;
+            5) _service_menu ;;
+            6) _view_log ;;
+            7) _view_argo_log ;;
+            8) _check_config ;;
+            9) _update_core ;;
+            10) _update_script && exit 0 ;;
+            11) _uninstall_deploy ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -1685,25 +2084,36 @@ _print_help() {
     cat >&2 <<EOF
 Xray-go 管理脚本 v${SCRIPT_VERSION}
 
-用法: $(basename "$0") [命令]
+用法: $(basename "$0") [快捷指令 | 命令]
 
-  (无参数)          进入交互式管理菜单
-  deploy            一键部署 Reality + H3（随机端口）
-  custom            自定义部署（交互选择协议/端口/Argo）
-  links             查看节点链接与 Base64 订阅
-  status            查看运行状态
-  start|stop|restart 控制 Xray 服务
-  log               查看实时日志
-  check             校验配置文件
-  update-core       更新 Xray 核心
-  update-script     更新本脚本
-  uninstall         卸载部署
+  快捷指令：
+    1              进入管理菜单（推荐）
+    2              一键部署 Reality + H3
+    3              查看节点链接
+    4              查看运行状态
+    5              卸载部署
+    0              退出
+
+  完整命令：
+    menu              进入管理菜单
+    deploy            一键部署 Reality + H3（随机端口）
+    custom            自定义部署（可选协议/端口/Argo）
+    argo              Argo 自动搭建（CF 邮箱 + Global API Key）
+    links             查看节点链接与 Base64 订阅
+    status            查看运行状态
+    start|stop|restart 控制 Xray 服务
+    log               查看实时日志
+    check             校验配置文件
+    update-core       更新 Xray 核心
+    update-script     更新本脚本
+    uninstall         卸载部署
 
 兼容旧版参数写法（示例）:
   $(basename "$0") reality"n" h3"y" argo protocol"http2" port"8001" domain"" token""
 
 环境变量（一键部署时可选）:
   ARGO_TOKEN / ARGO_DOMAIN / ARGO_PROTOCOL / ARGO_PORT
+  CF_EMAIL / CF_API_KEY   （提供后 Argo 走自动搭建，无需手动建隧道）
 EOF
 }
 
@@ -1715,12 +2125,40 @@ main() {
             _print_help
             return 0
             ;;
+        -v | --version)
+            echo "v${SCRIPT_VERSION}"
+            return 0
+            ;;
     esac
 
     _check_root
     _detect_init_system
 
     case "$cmd" in
+        # ---- 快捷指令 1-5 ----
+        1)
+            _install_dependencies || _warn "依赖安装未完全成功，部分功能可能不可用。"
+            _main_menu
+            ;;
+        2)
+            _install_dependencies || exit 1
+            _one_click_deploy
+            ;;
+        3)
+            _install_dependencies >/dev/null 2>&1
+            _show_links
+            ;;
+        4)
+            _install_dependencies >/dev/null 2>&1
+            _show_status
+            ;;
+        5)
+            _uninstall_deploy
+            ;;
+        0 | q | quit | exit)
+            exit 0
+            ;;
+        # ---- 完整命令 ----
         deploy | install | onekey)
             _install_dependencies || exit 1
             _one_click_deploy
@@ -1728,6 +2166,9 @@ main() {
         custom)
             _install_dependencies || exit 1
             _custom_deploy
+            ;;
+        argo | add-argo | argo-setup)
+            _add_argo_only
             ;;
         links | show)
             _install_dependencies >/dev/null 2>&1
