@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.3"
+export SCRIPT_VERSION="2.4"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -513,6 +513,69 @@ _listen_check() {
     fi
 }
 
+# 统计与 Cloudflare 边缘（7844）的连接数，输出 "udp tcp"
+# 依次尝试 ss → netstat → /proc/net/*：Alpine 的 busybox 常常只有 netstat（且不一定认 -p），
+# 容器里有时连 netstat 都没有，只能读内核表（7844 = 0x1EA4）。
+_count_edge_conns() {
+    local udp=0 tcp=0 f out
+
+    if command -v ss >/dev/null 2>&1; then
+        out=$(ss -aunp 2>/dev/null); [ -n "$out" ] || out=$(ss -aun 2>/dev/null)
+        udp=$(printf '%s\n' "$out" | grep -cE 'cloudflared|:7844')
+        out=$(ss -atnp 2>/dev/null); [ -n "$out" ] || out=$(ss -atn 2>/dev/null)
+        tcp=$(printf '%s\n' "$out" | grep -cE 'cloudflared|:7844')
+        if [ "${udp:-0}" -gt 0 ] || [ "${tcp:-0}" -gt 0 ]; then
+            printf '%s %s' "$udp" "$tcp"
+            return 0
+        fi
+    fi
+
+    if command -v netstat >/dev/null 2>&1; then
+        out=$(netstat -anup 2>/dev/null); [ -n "$out" ] || out=$(netstat -anu 2>/dev/null)
+        udp=$(printf '%s\n' "$out" | grep -cE 'cloudflared|:7844')
+        out=$(netstat -antp 2>/dev/null); [ -n "$out" ] || out=$(netstat -ant 2>/dev/null)
+        tcp=$(printf '%s\n' "$out" | grep -cE 'cloudflared|:7844')
+        if [ "${udp:-0}" -gt 0 ] || [ "${tcp:-0}" -gt 0 ]; then
+            printf '%s %s' "$udp" "$tcp"
+            return 0
+        fi
+    fi
+
+    # 兜底：直接数内核套接字表，远端端口 7844(0x1EA4) 即为到边缘的长连接
+    udp=0; tcp=0
+    for f in /proc/net/udp /proc/net/udp6; do
+        [ -r "$f" ] || continue
+        udp=$((udp + $(awk '$3 ~ /:1EA4$/ {c++} END{print c+0}' "$f" 2>/dev/null)))
+    done
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$f" ] || continue
+        tcp=$((tcp + $(awk '$3 ~ /:1EA4$/ && $4 == "01" {c++} END{print c+0}' "$f" 2>/dev/null)))
+    done
+    printf '%s %s' "$udp" "$tcp"
+}
+
+# 采集 cloudflared 日志文本（三种托管方式落点不同）
+_collect_argo_logtext() {
+    local text="" f
+
+    [ -s "$ARGO_LOG_FILE" ] && text=$(tail -n 500 "$ARGO_LOG_FILE" 2>/dev/null)
+
+    if [ -z "$text" ] && command -v journalctl >/dev/null 2>&1; then
+        text=$(journalctl -u xray-argo -n 500 --no-pager 2>/dev/null)
+    fi
+
+    # openrc 下日志可能被 supervise-daemon 丢进 syslog
+    if [ -z "$text" ]; then
+        for f in /var/log/messages /var/log/syslog /var/log/cloudflared.log; do
+            [ -s "$f" ] || continue
+            text=$(grep -i 'cloudflared' "$f" 2>/dev/null | tail -n 300)
+            [ -n "$text" ] && break
+        done
+    fi
+
+    printf '%s' "$text"
+}
+
 _argo_transport() {
     local cfg="" proc_proto="" udp=0 tcp=0 log_proto="" logtext="" fallback=false state="unknown"
 
@@ -523,19 +586,19 @@ _argo_transport() {
         | sed -n 's/.*--protocol[= ]\{1\}\([a-z0-9]*\).*/\1/p' | head -n1)
 
     # 与 Cloudflare 边缘的连接：QUIC 是 UDP 套接字，http2 是 TCP 连接（端口都是 7844）
-    if command -v ss >/dev/null 2>&1; then
-        udp=$(ss -aunp 2>/dev/null | awk '(/cloudflared/ || /:7844/) {c++} END{print c+0}')
-        tcp=$(ss -atnp 2>/dev/null | awk '(/cloudflared/ || /:7844/) {c++} END{print c+0}')
-    fi
+    local conns
+    conns=$(_count_edge_conns)
+    udp=${conns%% *}
+    tcp=${conns##* }
     udp=${udp:-0}; tcp=${tcp:-0}
 
-    # 日志：direct 模式写文件，systemd 走 journald
-    if [ -s "$ARGO_LOG_FILE" ]; then
-        logtext=$(tail -n 300 "$ARGO_LOG_FILE" 2>/dev/null)
-    elif command -v journalctl >/dev/null 2>&1; then
-        logtext=$(journalctl -u xray-argo -n 300 --no-pager 2>/dev/null)
-    fi
-    log_proto=$(printf '%s' "$logtext" | grep -o 'protocol=[a-z0-9]*' | tail -n1 | cut -d= -f2)
+    logtext=$(_collect_argo_logtext)
+
+    # cloudflared 的注册日志形如：... protocol=quic；不同版本/日志源分隔符可能是 = 或 :
+    log_proto=$(printf '%s' "$logtext" | grep -oE 'protocol[=: ]+[a-z0-9]+' | tail -n1 | sed 's/.*[=: ]//')
+    [ -n "$log_proto" ] || log_proto=$(printf '%s' "$logtext" \
+        | grep -oiE 'transport[=: ]+(quic|http2)|using (quic|http2)' | tail -n1 \
+        | grep -oiE 'quic|http2')
     printf '%s' "$logtext" | grep -qiE 'falling back|fallback|failed to dial to edge with quic|quic.*fail' && fallback=true
 
     if [ "$fallback" = true ]; then
@@ -1678,7 +1741,7 @@ _diag() {
     echo -e "  隧道协议 : ${aproto:-未记录}" >&2
     echo -e "  本地监听 : 127.0.0.1:${ap}   TCP:$(_listen_check "${ap}" t)" >&2
 
-    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" xff=0
+    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" xff=0 xff_cfg=0
     IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log < <(_argo_transport)
     echo "" >&2
     echo -e "${CYAN}════════ Argo 传输（UDP / QUIC）════════${NC}" >&2
@@ -1689,12 +1752,23 @@ _diag() {
         quic)     echo -e "  实际传输 : ${GREEN}QUIC（UDP）${NC}" >&2 ;;
         http2)    echo -e "  实际传输 : ${YELLOW}HTTP/2（TCP）${NC}" >&2 ;;
         fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
-        *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（服务未运行或日志为空）" >&2 ;;
+        *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（连接计数与隧道日志都没取到）" >&2 ;;
     esac
+    if [ "${at_udp:-0}" = "0" ] && [ "${at_tcp:-0}" = "0" ] && _argo_is_running; then
+        echo -e "     ${CYAN}cloudflared 在跑但数不到连接${NC}：本机没有 ss/netstat，内核表也读不到。" >&2
+        echo -e "     不影响使用，可看 ${CYAN}xg argo-log${NC} 里的 protocol=xxx。" >&2
+    fi
 
-    # cloudflared 每个请求都带 X-Forwarded-For；核心没声明信任来源就刷 Warning（无害但很吵）
-    [ -s "$LOG_FILE" ] && xff=$(grep -c 'trustedXForwardedFor' "$LOG_FILE" 2>/dev/null)
-    xff=${xff:-0}
+    # cloudflared 每个请求都带 X-Forwarded-For；核心没声明信任来源就刷 Error（无害但很吵）
+    # 注意日志原文是 "ignored potentially forged \"X-Forwarded-For\""，不是 trustedXForwardedFor
+    if [ -s "$LOG_FILE" ]; then
+        xff=$(grep -c 'ignored potentially forged' "$LOG_FILE" 2>/dev/null)
+        xff=${xff:-0}
+    fi
+    # 当前 config.json 里是否已经声明了信任来源（区分「历史日志」和「还没修」）
+    if [ -s "$CONFIG_FILE" ] && grep -q 'trustedXForwardedFor' "$CONFIG_FILE" 2>/dev/null; then
+        xff_cfg=1
+    fi
     if [ "$xff" -gt 0 ] 2>/dev/null; then
         echo -e "  XFF 警告 : ${xff} 条（不影响使用，仅刷日志）" >&2
     fi
@@ -1750,8 +1824,14 @@ _diag() {
     esac
 
     if [ "${xff:-0}" -gt 0 ] 2>/dev/null; then
-        echo -e "  ${CYAN}X-Forwarded-For 警告${NC}：Argo 每个请求都会带该头，核心未声明信任来源时会刷日志。" >&2
-        echo -e "     无害，不影响连通性。消除办法：${CYAN}xg rebuild${NC}（新版模板已给 Argo inbound 加 sockopt.trustedXForwardedFor）。" >&2
+        if [ "${xff_cfg:-0}" = "1" ]; then
+            echo -e "  ${CYAN}X-Forwarded-For 记录${NC}：config.json 已声明 trustedXForwardedFor，这些是改配置之前的历史日志。" >&2
+            echo -e "     想清空：${CYAN}> ${LOG_FILE}${NC}（不影响运行），之后应不再新增。" >&2
+        else
+            echo -e "  ${CYAN}X-Forwarded-For 警告${NC}：Argo 每个请求都会带该头，核心未声明信任来源就忽略它并记一条 Error。" >&2
+            echo -e "     影响：日志里的客户端 IP 全是 127.0.0.1，连通性不受影响。" >&2
+            echo -e "     消除办法：${CYAN}xg rebuild${NC}（会用新版模板给 Argo inbound 加 sockopt.trustedXForwardedFor）。" >&2
+        fi
     fi
 
     [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
