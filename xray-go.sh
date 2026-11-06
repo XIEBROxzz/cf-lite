@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.16"
+export SCRIPT_VERSION="2.17"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -40,7 +40,9 @@ CF_ACCOUNT_ID=""
 ARGO_TOKEN="${ARGO_TOKEN:-}"
 ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_PORT="${ARGO_PORT:-8001}"
-ARGO_PROTOCOL="${ARGO_PROTOCOL:-quic}"
+# 默认 http2：国内运营商普遍对 UDP 大流量 QoS，且 YouTube 这类自身走 QUIC 的
+# 应用叠在 QUIC 隧道上会出现 QUIC-in-QUIC 双重拥塞，实测更卡。quic 改为可选。
+ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
 ARGO_TUNNEL_ID="${ARGO_TUNNEL_ID:-}"
 ARGO_ZONE_ID="${ARGO_ZONE_ID:-}"
 DEP_STATE_VERSION="20261106-2"
@@ -1174,7 +1176,7 @@ _restart() {
             [ -f "$STATE/argo.env" ] || return 0
             set -a; . "$STATE/argo.env"; set +a
             _proto=$(sed -n 's/.*"argo_protocol"[^,}]*"\([a-z0-9]*\)".*/\1/p' "$META" 2>/dev/null | head -n1)
-            [ -n "$_proto" ] || _proto="quic"
+            [ -n "$_proto" ] || _proto="http2"
             nohup "$CLOUDFLARED" tunnel --no-autoupdate --retries 5 --grace-period 1s \
                 --protocol "$_proto" --ha-connections 4 run >> "$ARGO_LOG" 2>&1 &
             echo $! > "$ARGO_PID"
@@ -1755,7 +1757,7 @@ _argo_auto_setup() {
     ARGO_TOKEN=""
     ARGO_DOMAIN=""
     ARGO_PORT="8001"
-    ARGO_PROTOCOL="quic"
+    ARGO_PROTOCOL="http2"
     ARGO_TUNNEL_ID=""
     ARGO_ZONE_ID=""
 
@@ -1773,11 +1775,13 @@ _argo_auto_setup() {
     read -r -p "  Argo 本地端口（回车 8001，需与 ingress 一致）: " port || port=""
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || port="8001"
 
-    read -r -p "  隧道协议 [1.quic 2.http2]（回车 quic）: " proto || proto=""
+    # 默认 http2：UDP 7844 常被运营商 QoS，且 QUIC 隧道里再跑 QUIC（YouTube）
+    # 会双重拥塞、看视频频繁缓冲。quic 保留给线路干净、想要低延迟的场景。
+    read -r -p "  隧道协议 [1.http2 2.quic]（回车 http2）: " proto || proto=""
     case "${proto,,}" in
-        1 | quic | q)          proto="quic" ;;
-        2 | http2 | h2 | tcp)  proto="http2" ;;
-        *)                     proto="quic" ;;
+        1 | http2 | h2 | tcp)  proto="http2" ;;
+        2 | quic | q | udp)    proto="quic" ;;
+        *)                     proto="http2" ;;
     esac
 
     _info "正在查询 ${domain} 所属 Zone..."
@@ -2852,7 +2856,7 @@ Xray-go · Argo 隧道版 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     [7] 诊断   [8] 重建配置   [9] 更新核心   [10] 更新脚本   [11] 卸载
 
 环境变量（部署时可选，免去交互）:
-  ARGO_DOMAIN / ARGO_PROTOCOL(1=quic 2=http2) / ARGO_PORT
+  ARGO_DOMAIN / ARGO_PROTOCOL(1=http2 2=quic) / ARGO_PORT
   CF_EMAIL / CF_API_KEY
 EOF
 }
