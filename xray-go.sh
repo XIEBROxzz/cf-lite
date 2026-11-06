@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.7"
+export SCRIPT_VERSION="2.8"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -577,6 +577,26 @@ _collect_argo_logtext() {
     printf '%s' "$text"
 }
 
+# 最近一次启动之后的日志段。
+# 日志是累积的（每次重启都会再注册一批），跨重启混在一起会把「以前用过 http2」
+# 误判成「现在在回退」。批次边界不止 Starting tunnel：有的版本/日志源会漏掉它，
+# 所以 Settings / Initial protocol 也当边界，命中任意一个就从头累积。
+_argo_batch() {
+    local logtext
+    logtext=$(_collect_argo_logtext)
+    [ -n "$logtext" ] || return 0
+    printf '%s\n' "$logtext" \
+        | awk '/Starting tunnel|Initial protocol|Settings: map\[/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}'
+}
+
+# 把任意输入规整成非负整数（grep -c 在异常时可能给空串）
+_argo_int() {
+    case "${1:-}" in
+        ''|*[!0-9]*) printf '0' ;;
+        *)           printf '%s' "$1" ;;
+    esac
+}
+
 _argo_transport() {
     local cfg="" proc_proto="" udp=0 tcp=0 log_proto="" logtext="" fallback=false state="unknown"
 
@@ -595,27 +615,29 @@ _argo_transport() {
 
     logtext=$(_collect_argo_logtext)
 
-    # 日志是累积的（每次重启都会再注册一批），只看「最近一次启动」之后的那批，
-    # 否则跨重启混在一起会把「以前用过 http2」误判成「现在在回退」。
-    # 批次边界不止 Starting tunnel：有的版本/日志源会漏掉它，所以把启动时的
-    # Settings / Initial protocol 也当边界，只要命中任意一个就从头累积。
     local batch=""
-    batch=$(printf '%s\n' "$logtext" \
-        | awk '/Starting tunnel|Initial protocol|Settings: map\[/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}')
+    batch=$(_argo_batch)
     [ -n "$batch" ] || batch="$logtext"
-    local mix_q=0 mix_h=0 mix_n=0
-    if [ -n "$batch" ]; then
-        mix_q=$(printf '%s\n' "$batch" | grep -c 'protocol=quic')
-        mix_h=$(printf '%s\n' "$batch" | grep -c 'protocol=http2')
-        mix_q=${mix_q:-0}; mix_h=${mix_h:-0}
-        mix_n=$((mix_q + mix_h))
+
+    # 统一口径：只认「注册成功」那些行里的 protocol 值。
+    # 不能用宽正则扫整段 —— Settings 里的 map[... protocol:http2 ...] 也会被算进去，
+    # 于是出现「日志协议 http2 / 明细 http2 0 条」这种自相矛盾的输出。
+    local protos=""
+    protos=$(printf '%s\n' "$batch" | grep 'Registered tunnel connection' \
+        | grep -oE 'protocol[=: ]+[a-z0-9]+' | sed 's/.*[=: ]//')
+    if [ -z "$protos" ]; then
+        # 日志源把注册行裁掉了，退化为任意 protocol 字段（口径放宽，仅作兜底）
+        protos=$(printf '%s\n' "$batch" | grep -oE 'protocol[=: ]+[a-z0-9]+' | sed 's/.*[=: ]//')
     fi
 
-    # cloudflared 的注册日志形如：... protocol=quic；不同版本/日志源分隔符可能是 = 或 :
-    log_proto=$(printf '%s' "$batch" | grep -oE 'protocol[=: ]+[a-z0-9]+' | tail -n1 | sed 's/.*[=: ]//')
-    [ -n "$log_proto" ] || log_proto=$(printf '%s' "$batch" \
-        | grep -oiE 'transport[=: ]+(quic|http2)|using (quic|http2)' | tail -n1 \
-        | grep -oiE 'quic|http2')
+    local mix_q=0 mix_h=0 mix_n=0
+    if [ -n "$protos" ]; then
+        mix_q=$(_argo_int "$(printf '%s\n' "$protos" | grep -c '^quic$')")
+        mix_h=$(_argo_int "$(printf '%s\n' "$protos" | grep -c '^http2$')")
+    fi
+    mix_n=$((mix_q + mix_h))
+
+    log_proto=$(printf '%s\n' "$protos" | tail -n1)
     # 真正的回退证据只有两种：明确说 failed to dial / falling back，
     # 或者「配置要 quic，但注册结果里一条 quic 都没有」。
     # 不能用 'quic.*fail' 这种宽泛正则 —— precheck 里那行
@@ -1798,6 +1820,13 @@ _diag() {
         fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
         *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（连接计数与隧道日志都没取到）" >&2 ;;
     esac
+    # 混合/回退时把每条连接的协议列出来，省得再手工翻日志
+    if [ "${at_state:-}" = "mixed" ] || [ "${at_state:-}" = "fallback" ]; then
+        local conns
+        conns=$(_argo_batch | grep 'Registered tunnel connection' | tail -n 8 \
+            | sed -n 's/.*connIndex=\([0-9]*\).*location=\([a-z0-9]*\).*protocol=\([a-z0-9]*\).*/       conn\1  \2  \3/p')
+        [ -n "$conns" ] && printf '%s\n' "$conns" >&2
+    fi
     # cloudflared 启动时的 UDP 连通性自检结果（region1/region2 各探一次）
     if [ -n "${at_pre:-}" ] && [ "${at_pre}" != "-/-" ]; then
         echo -e "  UDP 自检 : region1 ${at_pre%%/*} / region2 ${at_pre##*/}   （cloudflared precheck）" >&2
