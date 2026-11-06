@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.10"
+export SCRIPT_VERSION="2.11"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -1078,12 +1078,23 @@ _argo_action() {
 # ── Argo 保活（cron watchdog）─────────────────────────────────────────
 # 服务托管层只能救「进程退出」：systemd 靠 Restart=always，openrc 靠
 # supervise-daemon；而 openrc 老模板用 command_background，崩了不会自己起来。
-# 这一层用 crontab 每分钟巡检一次：进程不在就拉起；进程在但连续 3 分钟
+# 这一层用 crontab 定时巡检（默认 60 秒，可设 30 秒）：进程不在就拉起；进程在但连续 3 次
 # 一条边缘连接都没有，也重启（对应「4 条通道全断但进程僵着」的情况）。
 #
 # 保活脚本落到 $XRAY_DIR 下独立执行 —— xg 是临时下载后跑的，没有固定路径，
 # 不能像 CF-B 那样直接让 cron 调主脚本。
 KEEPALIVE_SCRIPT="${XRAY_DIR}/argo-keepalive.sh"
+KEEPALIVE_INTERVAL_FILE="${XRAY_DIR}/keepalive.interval"
+
+# 巡检间隔（秒）。cron 最小粒度是 1 分钟，30 秒靠两条 crontab 错开半分钟实现。
+_keepalive_interval() {
+    local v=""
+    [ -s "$KEEPALIVE_INTERVAL_FILE" ] && v=$(tr -dc '0-9' < "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null)
+    case "$v" in
+        15 | 20 | 30 | 60) echo "$v" ;;
+        *) echo "60" ;;
+    esac
+}
 
 _write_keepalive_script() {
     local init="$1"
@@ -1175,7 +1186,7 @@ strike=${strike:-0}
 strike=$((strike + 1))
 echo "$strike" > "$STRIKE" 2>/dev/null
 if [ "$strike" -ge 3 ]; then
-    _log "Argo 隧道连续 3 分钟无边缘连接，正在重启"
+    _log "Argo 隧道连续 3 次巡检无边缘连接，正在重启"
     echo 0 > "$STRIKE" 2>/dev/null
     _restart
 fi
@@ -1235,19 +1246,40 @@ _watchdog_enabled() {
 }
 
 _enable_argo_watchdog() {
-    local job
+    local interval="${1:-$(_keepalive_interval)}"
+    local slots i off lines=""
+    case "$interval" in
+        15 | 20 | 30 | 60) ;;
+        *) interval=60 ;;
+    esac
     _write_keepalive_script "$INIT_SYSTEM" || return 1
     if ! _ensure_cron_service; then
         _warn "cron 不可用，保活未启用（服务托管层仍会兜底）。"
         return 1
     fi
+    # 先摘掉旧条目：改间隔时不会叠加出重复任务
     if _watchdog_enabled; then
-        _info "Argo 保活已在运行（每分钟巡检）。"
-        return 0
+        crontab -l 2>/dev/null | grep -Fv "$KEEPALIVE_SCRIPT" | crontab - 2>/dev/null || true
     fi
-    job="* * * * * /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1"
-    if (crontab -l 2>/dev/null; echo "$job") | crontab - 2>/dev/null; then
-        _success "Argo 保活已启用：每分钟巡检，进程退出或无边缘连接时自动重启。"
+    # 60 秒 → 1 条；30 秒 → 2 条（第 2 条先 sleep 30）；15 秒 → 4 条
+    slots=$((60 / interval))
+    [ "$slots" -ge 1 ] || slots=1
+    i=0
+    while [ "$i" -lt "$slots" ]; do
+        off=$((i * interval))
+        if [ "$off" -eq 0 ]; then
+            lines="${lines}* * * * * /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1
+"
+        else
+            lines="${lines}* * * * * sleep ${off}; /bin/sh ${KEEPALIVE_SCRIPT} >/dev/null 2>&1
+"
+        fi
+        i=$((i + 1))
+    done
+    if (crontab -l 2>/dev/null; printf '%s' "$lines") | crontab - 2>/dev/null; then
+        printf '%s\n' "$interval" > "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null || true
+        chmod 600 "$KEEPALIVE_INTERVAL_FILE" 2>/dev/null || true
+        _success "Argo 保活已启用：每 ${interval} 秒巡检，进程退出或无边缘连接时自动重启。"
         return 0
     fi
     _warn "写入 crontab 失败，保活未启用。"
@@ -2387,7 +2419,7 @@ _show_status() {
         echo -e "  隧道     : $(jq -r 'if (.argo_port // 0) > 0 then ((.argo_domain // "-") + "  (" + (.argo_protocol // "http2") + " / 127.0.0.1:" + (.argo_port | tostring) + ")") else "未配置" end' "$META_FILE" 2>/dev/null)" >&2
         echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
         if _watchdog_enabled; then
-            echo -e "  自动保活 : ${GREEN}已开启${NC}（cron 每分钟巡检，崩溃自动拉起）" >&2
+            echo -e "  自动保活 : ${GREEN}已开启${NC}（每 $(_keepalive_interval) 秒巡检，崩溃自动拉起）" >&2
         elif [ -x "$KEEPALIVE_SCRIPT" ]; then
             echo -e "  自动保活 : ${YELLOW}脚本在但 cron 未挂${NC}（${CYAN}xg keepalive-on${NC}）" >&2
         else
@@ -2537,7 +2569,7 @@ Xray-go · Argo 隧道版 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
     log               查看 Xray 实时日志
     argo-log          查看 Argo 实时日志
     keepalive         手动执行一次保活巡检（cron 也是调它）
-    keepalive-on      开启 Argo 自动保活（cron 每分钟巡检，崩溃自动拉起）
+    keepalive-on [N]  开启 Argo 自动保活（N=60 默认 / 30 / 20 / 15 秒巡检）
     keepalive-off     关闭 Argo 自动保活
     rebuild           由 meta.json 重建配置并重启（端口/链接不变）
     check             校验配置文件
@@ -2640,7 +2672,7 @@ main() {
             fi
             ;;
         keepalive-on | watchdog-on)
-            _enable_argo_watchdog || return 1
+            _enable_argo_watchdog "${2:-}" || return 1
             ;;
         keepalive-off | watchdog-off)
             _disable_argo_watchdog
