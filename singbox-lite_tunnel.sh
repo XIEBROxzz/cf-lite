@@ -3437,9 +3437,32 @@ _main_menu() {
     done
 }
 
+# ── 快捷命令 sb ───────────────────────────────────────
+# 装一个 POSIX sh 包装：每次运行先拉本仓库最新脚本再执行（与 CF-A 的 x 同一思路）
+_ensure_shortcut() {
+    local target="/usr/local/bin/sb"
+    if [ -f "$target" ] && grep -q "XIEBROxzz/cf-lite/main/singbox-lite_tunnel.sh" "$target" 2>/dev/null; then
+        return 0
+    fi
+    # 不能用 <() 进程替换：Debian 等系统 /bin/sh 是 dash，不认这个语法
+    cat > "$target" << 'SBEOF'
+#!/bin/sh
+tmp=$(mktemp /tmp/singbox-lite.sbXXXXXX) 2>/dev/null || exit 1
+trap 'rm -f "$tmp"' EXIT
+if ! curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/singbox-lite_tunnel.sh -o "$tmp" 2>/dev/null; then
+    echo "下载主脚本失败，请检查网络后重试" >&2
+    exit 1
+fi
+bash "$tmp" "$@"
+SBEOF
+    chmod +x "$target" 2>/dev/null || true
+    _info "快捷命令 sb 已就绪（以后直接输入 sb 即可）"
+}
+
 main() {
     _check_root
     _detect_init_system
+    _ensure_shortcut
 
     mkdir -p "${SINGBOX_DIR}" 2>/dev/null
     chmod 700 "${SINGBOX_DIR}" 2>/dev/null || true

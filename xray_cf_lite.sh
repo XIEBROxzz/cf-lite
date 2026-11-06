@@ -1367,7 +1367,7 @@ do_restart() {
 ensure_shortcut() {
     local target="/usr/local/bin/x"
     # 已指向本仓库则跳过；否则（旧版/指向别处）一律重写，避免一直拉到旧脚本
-    if [[ -f "$target" ]] && grep -q "XIEBROxzz/xray-cf-lite" "$target"; then
+    if [[ -f "$target" ]] && grep -q "XIEBROxzz/cf-lite/main/xray_cf_lite.sh" "$target"; then
         return
     fi
     # 注意：不能用 bash 的 <() 进程替换——Debian 等系统 /bin/sh 是 dash，不认识该语法；
@@ -1376,7 +1376,7 @@ ensure_shortcut() {
 #!/bin/sh
 tmp=$(mktemp /tmp/xray-cf-lite.xXXXXXX) 2>/dev/null || exit 1
 trap 'rm -f "$tmp"' EXIT
-if ! curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/xray-cf-lite/main/xray_cf_lite.sh -o "$tmp" 2>/dev/null; then
+if ! curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_cf_lite.sh -o "$tmp" 2>/dev/null; then
     echo "下载主脚本失败，请检查网络后重试" >&2
     exit 1
 fi
