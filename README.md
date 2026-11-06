@@ -1,5 +1,7 @@
-
 ## 🗂️ 三套方案：CF-A / CF-B / CF-C
+```bash
+apk update && apk add curl wget net-tools procps bash
+```
 
 **CF-A**  快捷键x CF CDN橙云
 
