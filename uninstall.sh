@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 #  Xray-go 一键卸载脚本
-#  清理内容：systemd/openrc 服务、direct 后台进程、配置与证书、日志、运行目录
+#  清理内容：systemd/openrc 服务、direct 后台进程、配置与 cloudflared、日志、运行目录
 #  用法：bash <(curl -Ls .../uninstall.sh) [-y]
 # ==============================================================================
 
@@ -118,7 +118,7 @@ _cleanup_cloud() {
 echo "" >&2
 echo -e "${YELLOW}  即将停止服务并删除以下内容：${NC}" >&2
 echo -e "    - Xray 服务 / Argo 隧道服务（systemd、openrc 或 direct 进程）" >&2
-echo -e "    - 配置目录: ${XRAY_DIR}（配置、证书、密钥、cloudflared）" >&2
+echo -e "    - 配置目录: ${XRAY_DIR}（配置、cloudflared、CF 凭据）" >&2
 echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
 echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
 [ -f /usr/local/bin/xg ] && echo -e "    - 管理命令: /usr/local/bin/xg" >&2

@@ -1,20 +1,19 @@
 #!/bin/bash
 # ==============================================================================
-#  Xray-go 一键部署管理脚本
-#  协议组合: VLESS-TCP-REALITY-Vision / XHTTP-H3(UDP 直连) / XHTTP-Argo 双模隧道
-#  部署流程参考 singbox-lite：依赖安装 -> 核心安装 -> 配置初始化
-#  -> 服务托管(systemd / openrc / direct) -> 菜单化管理
-#  支持一键部署（免交互）与自定义部署（交互式）
+#  Xray-go · Argo 隧道版
+#  XHTTP-Argo 双模隧道：H2-Argo（TCP）/ H3-Argo（UDP），全程走 Cloudflare
+#  Cloudflare 自动搭建（邮箱 + Global API Key）：建隧道 -> ingress -> DNS -> 启动
+#  服务托管：systemd / openrc / direct
 # ==============================================================================
 
 export LANG=en_US.UTF-8
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-# 配置、元数据、私钥仅 root 可读写
+# 配置、元数据、凭据仅 root 可读写
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="1.4"
+export SCRIPT_VERSION="2.0"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -27,8 +26,6 @@ XRAY_BIN="${XRAY_DIR}/xray"
 CONFIG_FILE="${XRAY_DIR}/config.json"
 META_FILE="${XRAY_DIR}/meta.json"
 LINKS_FILE="${XRAY_DIR}/url.txt"
-CERT_FILE="${XRAY_DIR}/cert.pem"
-KEY_FILE="${XRAY_DIR}/private.key"
 CLOUDFLARED_BIN="${XRAY_DIR}/cloudflared"
 ARGO_ENV_FILE="${XRAY_DIR}/argo.env"
 DEP_STATE_FILE="${XRAY_DIR}/dependencies.ok"
@@ -44,26 +41,21 @@ ARGO_PORT="${ARGO_PORT:-8001}"
 ARGO_PROTOCOL="${ARGO_PROTOCOL:-http2}"
 ARGO_TUNNEL_ID="${ARGO_TUNNEL_ID:-}"
 ARGO_ZONE_ID="${ARGO_ZONE_ID:-}"
-DEP_STATE_VERSION="20261106-1"
+DEP_STATE_VERSION="20261106-2"
 LOG_FILE="/var/log/xray.log"
 ARGO_LOG_FILE="/var/log/xray-argo.log"
 RUNTIME_DIR="/run/xraygo"
 PID_FILE="${RUNTIME_DIR}/xray.pid"
 ARGO_PID_FILE="${RUNTIME_DIR}/cloudflared.pid"
-# Reality 伪装目标域名：需是支持 TLS1.3 + H2 的真实站点
-DEFAULT_REALITY_SNI="${REALITY_SNI:-www.apple.com}"
-# 自签证书默认域名；可用环境变量 H3_SNI 覆盖（自动化部署时省掉交互）
-H3_SNI="${H3_SNI:-bing.com}"
-# 本次部署的覆盖值（由部署入口询问后设置，空则沿用 meta / 默认值）
-DEPLOY_REALITY_SNI="${DEPLOY_REALITY_SNI:-}"
-DEPLOY_H3_SNI="${DEPLOY_H3_SNI:-}"
-DEPLOY_H3_CERT="${DEPLOY_H3_CERT:-}"
-DEPLOY_H3_KEY="${DEPLOY_H3_KEY:-}"
+SERVICE_FILE="/etc/systemd/system/xray.service"
+ARGO_SERVICE_FILE="/etc/systemd/system/xray-argo.service"
 # 管理命令安装路径（可用 SELF_BIN 覆盖，便于测试/自定义安装位置）
 SELF_BIN="${SELF_BIN:-/usr/local/bin/xg}"
+# 客户端连接 Argo 用的 Cloudflare 优选地址
 CF_ADDR_H2="www.visa.com.hk"
 CF_ADDR_H3="www.teamviewer.com"
 CF_PORT="443"
+INIT_SYSTEM=""
 
 # --- 颜色与输出（统一写 stderr，避免污染命令替换） ---
 RED='\033[0;31m'
@@ -77,14 +69,14 @@ _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
 _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
 
-# 统一版本标签：V1.0
-_version_tag() { printf 'V%s' "${SCRIPT_VERSION}"; }
-# 完整版本串：V1.0 (2026-11-06)
-_version_full() { printf 'V%s (%s)' "${SCRIPT_VERSION}" "${SCRIPT_BUILD}"; }
 
 # ==============================================================================
 #  基础工具
 # ==============================================================================
+
+_version_tag() { printf 'V%s' "${SCRIPT_VERSION}"; }
+
+_version_full() { printf 'V%s (%s)' "${SCRIPT_VERSION}" "${SCRIPT_BUILD}"; }
 
 _check_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -169,8 +161,8 @@ _secure_permissions() {
     [ -d "$XRAY_DIR" ] && chmod 700 "$XRAY_DIR" 2>/dev/null || true
     [ -d "$RUNTIME_DIR" ] && chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
     local f
-    for f in "$CONFIG_FILE" "$META_FILE" "$LINKS_FILE" "$KEY_FILE" "$ARGO_ENV_FILE" \
-             "$CERT_FILE" "$DEP_STATE_FILE" "$CF_CRED_FILE" "$SERVICE_FILE" "$ARGO_SERVICE_FILE"; do
+    for f in "$CONFIG_FILE" "$META_FILE" "$LINKS_FILE" "$ARGO_ENV_FILE" \
+             "$DEP_STATE_FILE" "$CF_CRED_FILE" "$SERVICE_FILE" "$ARGO_SERVICE_FILE"; do
         [ -f "$f" ] && chmod 600 "$f" 2>/dev/null || true
     done
     return 0
@@ -191,63 +183,6 @@ _is_pid_file_running_cmd() {
     local pid_file="$1" pattern="$2"
     [ -s "$pid_file" ] || return 1
     _is_pid_running_cmd "$(cat "$pid_file" 2>/dev/null)" "$pattern"
-}
-
-_rand_port() {
-    local lo=30000 hi=50000 p=""
-    if command -v shuf >/dev/null 2>&1; then
-        p=$(shuf -i ${lo}-${hi} -n 1 2>/dev/null)
-    fi
-    [[ "$p" =~ ^[0-9]+$ ]] || p=$(( (RANDOM * 32768 + RANDOM) % (hi - lo + 1) + lo ))
-    printf '%s' "$p"
-}
-
-# 解析端口写法，输出 "<监听端口> <对外端口>"
-#   443         -> 监听 443，对外 443
-#   443:31000   -> 监听 443，对外 31000（NAT / 端口映射）
-#   空          -> 30000-50000 随机，内外一致
-# 无效返回 1
-_parse_port_spec() {
-    local spec listen public p
-    # 统一处理：去空白（含全角空格）、全角冒号转半角
-    spec=$(printf '%s' "${1:-}" | tr -d '[:space:]' | sed -e 's/：/:/g' -e 's/　//g')
-
-    if [ -z "$spec" ]; then
-        p=$(_pick_free_port)
-        printf '%s %s' "$p" "$p"
-        return 0
-    fi
-
-    case "$spec" in
-        *:*:*)
-            return 1
-            ;;
-    esac
-
-    case "$spec" in
-        *:*)
-            listen="${spec%%:*}"
-            public="${spec##*:}"
-            ;;
-        *)
-            listen="$spec"
-            public="$spec"
-            ;;
-    esac
-
-    [[ "$listen" =~ ^[0-9]+$ ]] && [ "$listen" -ge 1 ] && [ "$listen" -le 65535 ] || return 1
-    [[ "$public" =~ ^[0-9]+$ ]] && [ "$public" -ge 1 ] && [ "$public" -le 65535 ] || return 1
-    printf '%s %s' "$listen" "$public"
-}
-
-# 端口展示：443 + 31000 -> "443 → 对外 31000"；相同则只显示一个
-_port_desc() {
-    local l="$1" p="${2:-}"
-    if [ -z "$p" ] || [ "$l" = "$p" ]; then
-        printf '%s' "$l"
-    else
-        printf '%s → 对外 %s' "$l" "$p"
-    fi
 }
 
 _port_in_use() {
@@ -279,8 +214,13 @@ _gen_uuid() {
     printf '%s' "$u"
 }
 
-_num_or_zero() {
-    [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf '0'
+_rand_port() {
+    local lo=30000 hi=50000 p=""
+    if command -v shuf >/dev/null 2>&1; then
+        p=$(shuf -i ${lo}-${hi} -n 1 2>/dev/null)
+    fi
+    [[ "$p" =~ ^[0-9]+$ ]] || p=$(( (RANDOM * 32768 + RANDOM) % (hi - lo + 1) + lo ))
+    printf '%s' "$p"
 }
 
 _sha256() {
@@ -297,10 +237,6 @@ _ask_yes() {
     answer="${answer:-$default}"
     [[ "${answer,,}" =~ ^(y|yes)$ ]]
 }
-
-# ==============================================================================
-#  下载（官方优先，失败后走 Cloudflare 代理）
-# ==============================================================================
 
 _download() {
     local url="$1" out="$2" proxy
@@ -330,10 +266,6 @@ _api_get() {
     done
     return 1
 }
-
-# ==============================================================================
-#  核心安装
-# ==============================================================================
 
 _xray_arch_tag() {
     case "$(uname -m)" in
@@ -518,123 +450,6 @@ _install_cloudflared() {
     return 0
 }
 
-# ==============================================================================
-#  证书 / 密钥 / 配置
-# ==============================================================================
-
-_gen_certificate() {
-    local sni="${1:-$H3_SNI}" san_ip="${2:-}"
-    _info "正在生成 H3 自签证书 (SNI: ${sni})..."
-    if ! openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE" 2>/dev/null; then
-        _error "生成私钥失败（缺少 openssl）。"
-        return 1
-    fi
-
-    local san="DNS:${sni}"
-    [ -n "$san_ip" ] && san="${san},IP:${san_ip}"
-
-    # 现代 TLS 只认 SAN，优先带上；openssl < 1.1.1 不支持 -addext 时退回仅 CN
-    if ! openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" \
-        -subj "/CN=${sni}" -addext "subjectAltName=${san}" 2>/dev/null; then
-        if ! openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" \
-            -subj "/CN=${sni}" 2>/dev/null; then
-            _error "生成自签证书失败。"
-            return 1
-        fi
-        _warn "当前 openssl 不支持 -addext，证书未含 SAN，客户端需允许不安全证书。"
-    fi
-    chmod 600 "$KEY_FILE" "$CERT_FILE" 2>/dev/null || true
-    return 0
-}
-
-_gen_reality_keypair() {
-    local out pk pub
-    out=$("$XRAY_BIN" x25519 2>/dev/null)
-    pk=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*PrivateKey:[[:space:]]*//p' | head -n1)
-    pub=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*Password:[[:space:]]*//p' | head -n1)
-    if [ -z "$pk" ] || [ -z "$pub" ]; then
-        pk=$(printf '%s\n' "$out" | awk -F': *' '/Private/ {print $2; exit}')
-        pub=$(printf '%s\n' "$out" | awk -F': *' '/Public|Password/ {print $2; exit}')
-    fi
-    [ -n "$pk" ] && [ -n "$pub" ] || return 1
-    printf '%s %s\n' "$pk" "$pub"
-}
-
-# 由 meta.json 生成 config.json（单一数据源，可随时重建）
-_build_config_from_meta() {
-    jq --arg cert "$CERT_FILE" --arg key "$KEY_FILE" --arg logfile "$LOG_FILE" '
-        . as $m
-        | ([
-            (if (($m.reality_port // 0) > 0) then {
-                tag: "tcp-reality",
-                listen: "::",
-                port: ($m.reality_port | tonumber),
-                protocol: "vless",
-                settings: {
-                    clients: [{id: $m.uuid, flow: "xtls-rprx-vision"}],
-                    decryption: "none"
-                },
-                streamSettings: {
-                    network: "tcp",
-                    security: "reality",
-                    realitySettings: {
-                        fingerprint: "chrome",
-                        target: (($m.reality_sni // "www.apple.com") + ":443"),
-                        serverNames: [($m.reality_sni // "www.apple.com")],
-                        privateKey: $m.reality_private_key,
-                        shortIds: [$m.reality_short_id]
-                    }
-                },
-                sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false}
-            } else empty end),
-            (if (($m.h3_port // 0) > 0) then {
-                tag: "xhttp-h3",
-                listen: "::",
-                port: ($m.h3_port | tonumber),
-                protocol: "vless",
-                settings: {
-                    clients: [{id: $m.uuid, flow: ""}],
-                    decryption: "none"
-                },
-                streamSettings: {
-                    network: "xhttp",
-                    security: "tls",
-                    xhttpSettings: {mode: "auto", path: ("/" + ($m.h3_path // "h3"))},
-                    tlsSettings: {
-                        alpn: ["h3"],
-                        certificates: [{certificateFile: $cert, keyFile: $key}]
-                    }
-                },
-                sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false}
-            } else empty end),
-            (if ((($m.argo_port // 0) > 0) and (($m.argo_token // "") != "")) then {
-                tag: "xhttp-argo",
-                listen: "127.0.0.1",
-                port: ($m.argo_port | tonumber),
-                protocol: "vless",
-                settings: {
-                    clients: [{id: $m.uuid}],
-                    decryption: "none"
-                },
-                streamSettings: {
-                    network: "xhttp",
-                    security: "none",
-                    xhttpSettings: {path: ("/" + ($m.argo_path // "argo")), mode: "auto"},
-                    # cloudflared 会带 X-Forwarded-For；不声明信任来源时核心每次请求都刷一条 Warning
-                    # 这个 inbound 只监听 127.0.0.1，信任本机回环是安全的
-                    sockopt: {trustedXForwardedFor: ["127.0.0.1/32", "::1/128"]}
-                },
-                sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false}
-            } else empty end)
-        ]) as $inbounds
-        | {
-            log: {loglevel: "warning", error: $logfile},
-            inbounds: $inbounds,
-            outbounds: [{tag: "direct", protocol: "freedom"}]
-        }
-    ' "$META_FILE"
-}
-
 _write_config() {
     local tmp
     tmp=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX") || { _error "无法创建临时配置文件"; return 1; }
@@ -668,9 +483,6 @@ _check_config() {
     return 1
 }
 
-# 端口监听检测：proto 取 t(TCP) 或 u(UDP)
-# 注意：ss -lnt / ss -lnu 的输出列是 State Recv-Q Send-Q Local Peer，本地地址在 $4
-#      （带 netid 的 ss -lntu 才是 $5，这里不要混用）
 _listen_check() {
     local port="$1" proto="$2"
     [ "$port" = "0" ] && { printf '%s' "-"; return 0; }
@@ -685,9 +497,6 @@ _listen_check() {
     fi
 }
 
-# Argo 隧道实际传输：配置成 quic 不等于真的在跑 QUIC（UDP 不通会自动回退 http2）
-# 输出 5 段（\x1f 分隔）：状态 / 配置协议 / UDP 连接数 / TCP 连接数 / 日志里的协议
-# 状态取值：quic | http2 | fallback | unknown
 _argo_transport() {
     local cfg="" proc_proto="" udp=0 tcp=0 log_proto="" logtext="" fallback=false state="unknown"
 
@@ -725,193 +534,6 @@ _argo_transport() {
 
     printf '%s\x1f%s\x1f%s\x1f%s\x1f%s' "$state" "${cfg:-$proc_proto}" "$udp" "$tcp" "$log_proto"
 }
-
-# 连通性自检：环境 / 端口监听 / 防火墙 / 证书 / 日志 / 结论
-_diag() {
-    _check_root
-    _detect_init_system
-
-    echo "" >&2
-    echo -e "${CYAN}════════ 环境 ════════${NC}" >&2
-    echo -e "  脚本版本 : $(_version_full)" >&2
-    local core_ver="未安装"
-    [ -x "$XRAY_BIN" ] && core_ver=$("$XRAY_BIN" version 2>/dev/null | head -n1)
-    echo -e "  核心版本 : ${core_ver}" >&2
-    echo -e "  服务模式 : ${INIT_SYSTEM}" >&2
-    if _service_is_running; then
-        echo -e "  服务状态 : ${GREEN}运行中${NC}" >&2
-    else
-        echo -e "  服务状态 : ${RED}已停止${NC}" >&2
-    fi
-
-    if [ ! -s "$META_FILE" ]; then
-        _warn "尚未部署，无法继续自检。"
-        return 1
-    fi
-
-    local rp rpub hp hpub ap adom hs
-    IFS=$'\x1f' read -r rp rpub hp hpub ap adom hs < <(
-        jq -r '[((.reality_port // 0) | tostring),
-                ((.reality_public_port // .reality_port // 0) | tostring),
-                ((.h3_port // 0) | tostring),
-                ((.h3_public_port // .h3_port // 0) | tostring),
-                ((.argo_port // 0) | tostring),
-                (.argo_domain // ""),
-                (.h3_sni // "")]
-               | join("\u001f")' "$META_FILE" 2>/dev/null | tr -d '\r'
-    )
-
-    echo "" >&2
-    echo -e "${CYAN}════════ 端口监听 ════════${NC}" >&2
-    local r_tcp r_udp h_tcp h_udp
-    r_tcp=$(_listen_check "${rp:-0}" t)
-    r_udp=$(_listen_check "${rp:-0}" u)
-    h_tcp=$(_listen_check "${hp:-0}" t)
-    h_udp=$(_listen_check "${hp:-0}" u)
-    if [ "${rp:-0}" != "0" ]; then
-        echo -e "  Reality  : 监听 ${rp} → 对外 ${rpub}    TCP:${r_tcp}" >&2
-    else
-        echo -e "  Reality  : 未部署" >&2
-    fi
-    if [ "${hp:-0}" != "0" ]; then
-        echo -e "  H3       : 监听 ${hp} → 对外 ${hpub}    UDP:${h_udp}" >&2
-    else
-        echo -e "  H3       : 未部署" >&2
-    fi
-    if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
-        echo -e "  Argo     : 127.0.0.1:${ap} → ${adom}" >&2
-    else
-        echo -e "  Argo     : 未部署" >&2
-    fi
-
-    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log=""
-    if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
-        IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log < <(_argo_transport)
-        echo "" >&2
-        echo -e "${CYAN}════════ Argo 传输（UDP / QUIC）════════${NC}" >&2
-        echo -e "  配置协议 : ${at_cfg:-未记录}   （cloudflared --protocol）" >&2
-        echo -e "  日志协议 : ${at_log:-未采集到}   （protocol=xxx）" >&2
-        echo -e "  边缘连接 : UDP ${at_udp:-0} 条 / TCP ${at_tcp:-0} 条   （端口 7844）" >&2
-        case "$at_state" in
-            quic)     echo -e "  实际传输 : ${GREEN}QUIC（UDP）${NC}" >&2 ;;
-            http2)    echo -e "  实际传输 : ${YELLOW}HTTP/2（TCP）${NC}" >&2 ;;
-            fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
-            *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（服务未运行或日志为空）" >&2 ;;
-        esac
-
-        # cloudflared 每个请求都带 X-Forwarded-For；核心没声明信任来源就刷 Warning（无害但很吵）
-        local xff=0
-        [ -s "$LOG_FILE" ] && xff=$(grep -c 'trustedXForwardedFor' "$LOG_FILE" 2>/dev/null)
-        xff=${xff:-0}
-        if [ "$xff" -gt 0 ] 2>/dev/null; then
-            echo -e "  XFF 警告 : ${xff} 条（不影响使用，仅刷日志）" >&2
-        fi
-    fi
-
-    echo "" >&2
-    echo -e "${CYAN}════════ 防火墙 ════════${NC}" >&2
-    local fw_shown=false
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        fw_shown=true
-        ufw status 2>/dev/null | grep -E "(${rp}|${rpub}|${hp}|${hpub})" | sed 's/^/  ufw: /' >&2
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        fw_shown=true
-        echo -e "  firewalld: $(firewall-cmd --list-ports 2>/dev/null)" >&2
-    fi
-    if command -v iptables >/dev/null 2>&1; then
-        fw_shown=true
-        echo -e "  iptables 命中端口规则:" >&2
-        iptables -S INPUT 2>/dev/null | grep -E "dport (${rp}|${rpub}|${hp}|${hpub})" | sed 's/^/    /' >&2 || true
-    fi
-    [ "$fw_shown" = false ] && echo -e "  ${YELLOW}未检测到本机防火墙${NC}" >&2
-
-    if [ -s "$CERT_FILE" ]; then
-        echo "" >&2
-        echo -e "${CYAN}════════ H3 证书 ════════${NC}" >&2
-        echo -e "  $(openssl x509 -in "$CERT_FILE" -noout -subject -dates 2>/dev/null | tr '\n' ' ')" >&2
-        local san
-        san=$(openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName 2>/dev/null | tail -n1)
-        echo -e "  SAN: ${san:-无（客户端需 allowInsecure）}" >&2
-        echo -e "  配置 SNI: ${hs:-（未记录）}" >&2
-    fi
-
-    echo "" >&2
-    echo -e "${CYAN}════════ Xray 日志（末 10 行）════════${NC}" >&2
-    tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' >&2 || echo "  (无日志)" >&2
-
-    echo "" >&2
-    echo -e "${CYAN}════════ 结论 ════════${NC}" >&2
-    local issues=0
-
-    if [ "${hp:-0}" != "0" ] && [ "$h_udp" = "否" ]; then
-        issues=$((issues + 1))
-        _error "H3 已配置，但 UDP ${hp} 没有在监听 —— 核心没有起 QUIC 监听。"
-        echo -e "     XHTTP over H3 需要 Xray 1.8.19+，旧核心会静默忽略该 inbound。" >&2
-        echo -e "     处理：菜单 [10] 更新核心 → 重启服务，再回来看这一项。" >&2
-    fi
-    if [ "${hp:-0}" != "0" ] && [ "${hp}" != "${hpub}" ]; then
-        issues=$((issues + 1))
-        _warn "H3 用了端口映射 ${hp} → ${hpub}：云厂商安全组 / 路由器必须同时映射 UDP。"
-        echo -e "     只映射 TCP 的话 Reality 能通、H3 一定不通。" >&2
-    fi
-    if [ "${rp:-0}" != "0" ] && [ "$r_tcp" = "否" ]; then
-        issues=$((issues + 1))
-        _error "Reality 已配置，但 TCP ${rp} 没有在监听。"
-    fi
-    if ! _service_is_running; then
-        issues=$((issues + 1))
-        _error "Xray 服务未运行，所有节点都不会通。"
-        echo -e "     处理：菜单 [6] 启动服务，或查看日志定位。" >&2
-    fi
-    if [ "${hp:-0}" != "0" ] && [ "$h_udp" = "是" ] && _service_is_running; then
-        echo -e "  ${GREEN}服务端 H3 监听正常${NC}：若客户端仍不通，重点查云安全组 UDP、运营商 UDP 封锁、客户端核心版本。" >&2
-    fi
-    # SNI 与证书域名不一致时，客户端会直接拒绝握手（表现为"连上了但没网"）
-    if [ "${hp:-0}" != "0" ] && [ -n "${hs:-}" ] && [ -s "$CERT_FILE" ]; then
-        if ! openssl x509 -in "$CERT_FILE" -noout -subject -ext subjectAltName 2>/dev/null | grep -qF "$hs"; then
-            issues=$((issues + 1))
-            _warn "配置的 SNI (${hs}) 不在证书域名里 —— 客户端会校验失败。" >&2
-            echo -e "     处理：菜单 [2] 重部署 H3 时把 SNI 改成证书上的域名，或改用自签证书（链接带 allowInsecure=1）。" >&2
-        fi
-    fi
-    # Argo 这一跳是不是真的 UDP：配置 quic 但 UDP 不通时 cloudflared 会静默回退 http2
-    if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
-        case "$at_state" in
-            fallback)
-                issues=$((issues + 1))
-                _warn "Argo 隧道已从 QUIC 回退到 HTTP/2 —— 本机到 Cloudflare 的 UDP 7844 不通。" >&2
-                echo -e "     此时客户端用 H3-Argo 链接，第一跳是 UDP，但隧道这一跳已经是 TCP。" >&2
-                echo -e "     处理：换网络/换机器，或直接改用 H2-Argo 链接（更稳）。" >&2
-                ;;
-            http2)
-                if [ "$at_cfg" = "quic" ]; then
-                    issues=$((issues + 1))
-                    _warn "配置是 quic，但只有 TCP 连接 —— UDP 不通，已回退 HTTP/2。" >&2
-                else
-                    echo -e "  ${CYAN}Argo 隧道走 HTTP/2（TCP）${NC}：http2 模式的正常表现。" >&2
-                    echo -e "     想要全段 UDP：重部署 Argo 时选 quic，客户端再用 H3-Argo 链接。" >&2
-                fi
-                ;;
-            quic)
-                echo -e "  ${GREEN}Argo 隧道走 QUIC（UDP 7844）${NC}：客户端用 H3-Argo 链接即为全段 UDP。" >&2
-                ;;
-        esac
-        if [ "${xff:-0}" -gt 0 ] 2>/dev/null; then
-            echo -e "  ${CYAN}X-Forwarded-For 警告${NC}：Argo 每个请求都会带该头，核心未声明信任来源时会刷日志。" >&2
-            echo -e "     无害，不影响连通性。消除办法：${CYAN}xg rebuild${NC}（新版模板已给 Argo inbound 加 sockopt.trustedXForwardedFor）。" >&2
-        fi
-    fi
-
-    [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
-
-    echo "" >&2
-    return 0
-}
-
-# ==============================================================================
-#  服务托管
-# ==============================================================================
 
 _write_systemd_service() {
     cat > "$SERVICE_FILE" <<EOF
@@ -1112,10 +734,6 @@ _service_is_running() {
     esac
 }
 
-# ==============================================================================
-#  Argo 隧道
-# ==============================================================================
-
 _argo_connections() {
     local proto="${1,,}"
     if [ "$proto" = "http2" ]; then echo "4"; else echo "1"; fi
@@ -1282,12 +900,6 @@ _stop_all_services() {
     return 0
 }
 
-# ==============================================================================
-#  Cloudflare API：邮箱 + Global API Key 自动搭建 Argo 固定隧道
-#  自动完成：创建命名隧道 -> 写入 ingress -> 创建 DNS CNAME(proxied) -> 取回 Token
-#  卸载时自动删除云端隧道与 DNS 记录
-# ==============================================================================
-
 _cf_load_cred() {
     [ -s "$CF_CRED_FILE" ] || return 1
     CF_EMAIL=$(jq -r '.email // ""' "$CF_CRED_FILE" 2>/dev/null)
@@ -1318,7 +930,6 @@ _cf_verify() {
     printf '%s' "$r" | jq -e '.success == true' >/dev/null 2>&1
 }
 
-# 统一 CF API 调用；成功时把原始 JSON 输出到 stdout
 _cf_call() {
     local method="$1" endpoint="$2" data="${3:-}" resp msg
     local args=(curl -sS --connect-timeout 10 --max-time 40 -X "$method"
@@ -1370,7 +981,6 @@ _cf_prompt_cred() {
     done
 }
 
-# 域名 -> "zone_id account_id"（取最长后缀匹配的 Zone）
 _cf_find_zone() {
     local domain="$1" zones zn zi za best="" best_id="" best_acct=""
     zones=$(_cf_call GET "/zones?per_page=100") || return 1
@@ -1397,7 +1007,6 @@ _argo_tunnel_name() {
     printf '%s' "$name"
 }
 
-# 按名称查找未删除的同名隧道 -> tunnel_id（找不到返回空）
 _cf_find_tunnel_by_name() {
     local name="$1"
     _cf_call GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?name=${name}&is_deleted=false&per_page=50" 2>/dev/null \
@@ -1406,7 +1015,6 @@ _cf_find_tunnel_by_name() {
         ' 2>/dev/null
 }
 
-# 创建命名隧道 -> "tunnel_id token"（同名隧道已存在则复用，避免重复部署堆积）
 _cf_create_tunnel() {
     local name="$1" resp tid token existing
     existing=$(_cf_find_tunnel_by_name "$name")
@@ -1486,7 +1094,6 @@ _cf_delete_dns() {
     return 0
 }
 
-# 自动搭建主流程：成功时写入 ARGO_* 全局变量
 _argo_auto_setup() {
     ARGO_TOKEN=""
     ARGO_DOMAIN=""
@@ -1553,7 +1160,6 @@ _argo_auto_setup() {
     return 0
 }
 
-# 清理云端资源（卸载时调用）
 _argo_auto_cleanup() {
     local tid="$1" zid="$2" domain="$3"
     [ -n "$tid" ] || return 0
@@ -1573,40 +1179,6 @@ _argo_auto_cleanup() {
     fi
     return 0
 }
-
-# ==============================================================================
-#  防火墙
-# ==============================================================================
-
-_apply_firewall() {
-    local p
-    for p in "$@"; do
-        [[ "$p" =~ ^[0-9]+$ ]] || continue
-        [ "$p" = "0" ] && continue
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw allow "$p"/tcp >/dev/null 2>&1 || true
-            ufw allow "$p"/udp >/dev/null 2>&1 || true
-        fi
-        if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-            firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
-            firewall-cmd --permanent --add-port="${p}/udp" >/dev/null 2>&1 || true
-        fi
-        if command -v iptables >/dev/null 2>&1; then
-            iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
-                || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
-            iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null \
-                || iptables -A INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
-        fi
-    done
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-    return 0
-}
-
-# ==============================================================================
-#  节点链接
-# ==============================================================================
 
 _server_ip() {
     local ip=""
@@ -1628,556 +1200,6 @@ _isp_tag() {
     printf '%s' "$isp"
 }
 
-_show_links() {
-    [ -s "$META_FILE" ] || { _error "尚未部署，请先执行一键部署。"; return 1; }
-
-    local uuid reality_port reality_sni reality_pub reality_sid h3_port h3_sni h3_path \
-          argo_port argo_path argo_domain argo_protocol saved_ip h3_selfsigned
-    # 用 \x1f(US) 分隔：制表符属于空白字符，连续出现会被 read 合并，导致空字段错位
-    IFS=$'\x1f' read -r uuid reality_port reality_sni reality_pub reality_sid h3_port h3_sni h3_path \
-        argo_port argo_path argo_domain argo_protocol saved_ip h3_selfsigned < <(
-        jq -r '[.uuid // "",
-                ((.reality_public_port // .reality_port // 0) | tostring), (.reality_sni // ""), (.reality_public_key // ""), (.reality_short_id // ""),
-                ((.h3_public_port // .h3_port // 0) | tostring), (.h3_sni // ""), (.h3_path // ""),
-                ((.argo_port // 0) | tostring), (.argo_path // ""), (.argo_domain // ""), (.argo_protocol // ""),
-                (.server_ip // ""),
-                (if .h3_selfsigned == null then "true" else (.h3_selfsigned | tostring) end)]
-               | join("\u001f")' "$META_FILE" 2>/dev/null | tr -d '\r'
-    )
-
-    if [ -z "$uuid" ]; then
-        _error "元数据缺失，无法生成节点链接。"
-        return 1
-    fi
-
-    local ip isp host
-    ip=$(_server_ip)
-    [ -n "$ip" ] || ip="$saved_ip"
-    if [ -z "$ip" ]; then
-        _error "无法获取服务器 IP，请检查网络。"
-        return 1
-    fi
-    if [[ "$ip" == *:* ]]; then host="[${ip}]"; else host="$ip"; fi
-    isp=$(_isp_tag)
-
-    local lines=()
-    if [ "${reality_port:-0}" != "0" ] && [ -n "$reality_port" ]; then
-        lines+=("vless://${uuid}@${host}:${reality_port}?encryption=none&security=reality&sni=${reality_sni}&fp=chrome&pbk=${reality_pub}&sid=${reality_sid}&type=tcp&flow=xtls-rprx-vision#${isp}%20Reality%20Vision%20ESS")
-    fi
-    if [ "${h3_port:-0}" != "0" ] && [ -n "$h3_port" ]; then
-        # 自签证书必须允许不安全校验；自备域名证书则按正常校验走
-        local h3_insecure=""
-        [ "${h3_selfsigned:-true}" = "true" ] && h3_insecure="&allowInsecure=1"
-        lines+=("vless://${uuid}@${host}:${h3_port}?encryption=none&security=tls&sni=${h3_sni:-$H3_SNI}&alpn=h3&fp=chrome&type=xhttp&mode=auto&path=/${h3_path}${h3_insecure}#${isp}%20H3-XHTTP%20ESS")
-    fi
-    if [ -n "$argo_domain" ] && [ "${argo_port:-0}" != "0" ] && [ -n "$argo_port" ]; then
-        lines+=("vless://${uuid}@${CF_ADDR_H2}:${CF_PORT}?encryption=none&security=tls&alpn=h2&sni=${argo_domain}&fp=chrome&type=xhttp&mode=auto&host=${argo_domain}&path=/${argo_path}#${isp}%20H2-Argo%20XHTTP%20ESS")
-        lines+=("vless://${uuid}@${CF_ADDR_H3}:${CF_PORT}?encryption=none&security=tls&alpn=h3&sni=${argo_domain}&fp=chrome&type=xhttp&mode=auto&host=${argo_domain}&path=/${argo_path}#${isp}%20H3-Argo%20XHTTP%20ESS")
-    fi
-
-    if [ "${#lines[@]}" -eq 0 ]; then
-        _error "未找到任何已启用的协议。"
-        return 1
-    fi
-
-    printf '%s\n' "${lines[@]}" > "$LINKS_FILE" 2>/dev/null || true
-    chmod 600 "$LINKS_FILE" 2>/dev/null || true
-
-    local base64_str
-    base64_str=$(printf '%s\n' "${lines[@]}" | base64 2>/dev/null | tr -d '\n\r')
-
-    echo "" >&2
-    echo -e "${GREEN}════════════════════ 节点链接 ════════════════════${NC}" >&2
-    local l
-    for l in "${lines[@]}"; do
-        echo -e "${CYAN}${l}${NC}" >&2
-    done
-    echo -e "${GREEN}════════════════════ 订阅内容 ════════════════════${NC}" >&2
-    echo -e "${YELLOW}${base64_str}${NC}" >&2
-    echo -e "${GREEN}══════════════════════════════════════════════════${NC}" >&2
-    echo -e "链接已保存: ${LINKS_FILE}（含明文凭据，权限 600）" >&2
-    echo "" >&2
-    return 0
-}
-
-# ==============================================================================
-#  部署
-# ==============================================================================
-
-_deploy_all() {
-    local reality_port="$1" h3_port="$2" argo_protocol="$3" argo_port="$4" argo_domain="$5" argo_token="$6"
-    local argo_tunnel_id="${7:-}" argo_zone_id="${8:-}"
-    local reality_public="${9:-}" h3_public="${10:-}"
-
-    _check_root
-    _detect_init_system
-
-    reality_port=$(_num_or_zero "$reality_port")
-    h3_port=$(_num_or_zero "$h3_port")
-    argo_port=$(_num_or_zero "$argo_port")
-    reality_public=$(_num_or_zero "$reality_public")
-    h3_public=$(_num_or_zero "$h3_public")
-    [ "$reality_public" = "0" ] && reality_public="$reality_port"
-    [ "$h3_public" = "0" ] && h3_public="$h3_port"
-
-    if [ "$reality_port" = "0" ] && [ "$h3_port" = "0" ] && [ -z "$argo_token" ]; then
-        _error "未选择任何协议（Reality / H3 / Argo 均为空），已取消部署。"
-        return 1
-    fi
-    if [ -n "$argo_token" ] && { [ "$argo_port" = "0" ] || [ -z "$argo_domain" ]; }; then
-        _error "Argo 隧道需要同时提供「本地端口 + 隧道域名 + Token」，已取消部署。"
-        return 1
-    fi
-    [ -n "$argo_protocol" ] || argo_protocol="http2"
-
-    _info "=== 开始部署 Xray-go ==="
-    _stop_all_services
-
-    local p
-    for p in "$reality_port" "$h3_port"; do
-        [ "$p" = "0" ] && continue
-        if _port_in_use "$p"; then
-            _error "端口 ${p} 已被占用，请更换端口后重试。"
-            return 1
-        fi
-    done
-
-    _install_dependencies || return 1
-    _install_xray_core auto || return 1
-    if [ -n "$argo_token" ]; then
-        _install_cloudflared || return 1
-    fi
-
-    mkdir -p "$XRAY_DIR" "$RUNTIME_DIR" || { _error "创建目录失败"; return 1; }
-    chmod 700 "$XRAY_DIR" "$RUNTIME_DIR" 2>/dev/null || true
-
-    local uuid=""
-    [ -s "$META_FILE" ] && uuid=$(jq -r '.uuid // ""' "$META_FILE" 2>/dev/null)
-    [ -n "$uuid" ] || uuid=$(_gen_uuid)
-
-    # SNI 优先级：本次指定 > 已有部署记录 > 默认值（避免只重部署 Reality 时把 H3 的 SNI 重置）
-    local h3_sni="${DEPLOY_H3_SNI:-}"
-    if [ -z "$h3_sni" ] && [ -s "$META_FILE" ]; then
-        h3_sni=$(jq -r '.h3_sni // ""' "$META_FILE" 2>/dev/null)
-    fi
-    [ -n "$h3_sni" ] || h3_sni="$H3_SNI"
-
-    # Reality 伪装目标：本次指定 > 已有部署记录 > 默认值（只重部署 H3 时不会改动它）
-    local reality_sni="${DEPLOY_REALITY_SNI:-}"
-    if [ -z "$reality_sni" ] && [ -s "$META_FILE" ]; then
-        reality_sni=$(jq -r '.reality_sni // ""' "$META_FILE" 2>/dev/null)
-    fi
-    [ -n "$reality_sni" ] || reality_sni="$DEFAULT_REALITY_SNI"
-
-    local server_ip
-    server_ip=$(_server_ip)
-
-    # 证书来源：自定义证书 > 自签；未部署 H3 时沿用 meta 记录，避免把自签/自备状态改错
-    local h3_selfsigned=true
-    if [ -s "$META_FILE" ]; then
-        h3_selfsigned=$(jq -r 'if .h3_selfsigned == null then true else .h3_selfsigned end' "$META_FILE" 2>/dev/null)
-        [ -n "$h3_selfsigned" ] || h3_selfsigned=true
-    fi
-
-    if [ -n "${DEPLOY_H3_CERT:-}" ] && [ -n "${DEPLOY_H3_KEY:-}" ] \
-        && [ -f "$DEPLOY_H3_CERT" ] && [ -f "$DEPLOY_H3_KEY" ]; then
-        _info "正在使用自定义证书: ${DEPLOY_H3_CERT}"
-        cp -f "$DEPLOY_H3_CERT" "$CERT_FILE" 2>/dev/null || { _error "复制证书失败: ${DEPLOY_H3_CERT}"; return 1; }
-        cp -f "$DEPLOY_H3_KEY" "$KEY_FILE" 2>/dev/null || { _error "复制私钥失败: ${DEPLOY_H3_KEY}"; return 1; }
-        chmod 600 "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
-        h3_selfsigned=false
-    elif [ -n "${DEPLOY_H3_CERT:-}" ]; then
-        _warn "自定义证书文件已不存在，改用自签证书。"
-    fi
-
-    if [ "$h3_selfsigned" = "true" ]; then
-        if [ "$h3_port" != "0" ] || [ ! -s "$CERT_FILE" ] || [ ! -s "$KEY_FILE" ]; then
-            _gen_certificate "$h3_sni" "$server_ip" || return 1
-        else
-            _info "沿用现有 H3 证书（本次不部署 H3）。"
-        fi
-    fi
-
-    local keypair private_key="" public_key="" short_id=""
-    # 已有 Reality 密钥则沿用，避免只重部署 H3 时把 Reality 的 pbk/sid 换掉导致客户端失效
-    if [ -s "$META_FILE" ]; then
-        private_key=$(jq -r '.reality_private_key // ""' "$META_FILE" 2>/dev/null)
-        public_key=$(jq -r '.reality_public_key // ""' "$META_FILE" 2>/dev/null)
-        short_id=$(jq -r '.reality_short_id // ""' "$META_FILE" 2>/dev/null)
-    fi
-    if [ "$reality_port" != "0" ] && { [ -z "$private_key" ] || [ -z "$public_key" ]; }; then
-        _info "正在生成 Reality 密钥对..."
-        keypair=$(_gen_reality_keypair) || { _error "生成 Reality 密钥对失败。"; return 1; }
-        private_key="${keypair%% *}"
-        public_key="${keypair##* }"
-    fi
-    [ -n "$short_id" ] || short_id=$(openssl rand -hex 4)
-
-    local h3_path="${uuid}-xu"
-    local argo_path="${uuid}-argo"
-
-    _info "正在写入部署元数据..."
-    local meta_tmp
-    meta_tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
-    if ! jq -n \
-        --arg uuid "$uuid" \
-        --argjson reality_port "$reality_port" \
-        --argjson reality_public_port "$reality_public" \
-        --arg reality_sni "$reality_sni" \
-        --arg reality_private_key "$private_key" \
-        --arg reality_public_key "$public_key" \
-        --arg reality_short_id "$short_id" \
-        --argjson h3_port "$h3_port" \
-        --argjson h3_public_port "$h3_public" \
-        --arg h3_sni "$h3_sni" \
-        --argjson h3_selfsigned "$h3_selfsigned" \
-        --arg h3_path "$h3_path" \
-        --argjson argo_port "$argo_port" \
-        --arg argo_path "$argo_path" \
-        --arg argo_domain "$argo_domain" \
-        --arg argo_protocol "$argo_protocol" \
-        --arg argo_token "$argo_token" \
-        --arg argo_tunnel_id "$argo_tunnel_id" \
-        --arg argo_zone_id "$argo_zone_id" \
-        --arg server_ip "$server_ip" \
-        --arg created_at "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{
-            uuid: $uuid,
-            reality_port: $reality_port,
-            reality_public_port: $reality_public_port,
-            reality_sni: $reality_sni,
-            reality_private_key: $reality_private_key,
-            reality_public_key: $reality_public_key,
-            reality_short_id: $reality_short_id,
-            h3_port: $h3_port,
-            h3_public_port: $h3_public_port,
-            h3_sni: $h3_sni,
-            h3_selfsigned: $h3_selfsigned,
-            h3_path: $h3_path,
-            argo_port: $argo_port,
-            argo_path: $argo_path,
-            argo_domain: $argo_domain,
-            argo_protocol: $argo_protocol,
-            argo_token: $argo_token,
-            argo_tunnel_id: $argo_tunnel_id,
-            argo_zone_id: $argo_zone_id,
-            server_ip: $server_ip,
-            created_at: $created_at
-        }' > "$meta_tmp"; then
-        rm -f "$meta_tmp"
-        _error "写入 meta.json 失败。"
-        return 1
-    fi
-    chmod 600 "$meta_tmp" 2>/dev/null || true
-    mv -f "$meta_tmp" "$META_FILE" || { rm -f "$meta_tmp"; return 1; }
-
-    _info "正在生成 config.json..."
-    _write_config || return 1
-    _check_config || {
-        _error "配置未通过校验，部署已中止。"
-        return 1
-    }
-
-    _create_service_files
-    _secure_permissions
-
-    _info "正在启动 Xray 服务..."
-    if ! _manage_service restart; then
-        _error "Xray 启动失败，请查看日志: journalctl -u xray -n 50 或 ${LOG_FILE}"
-        return 1
-    fi
-    _success "Xray 服务已启动。"
-
-    if [ -n "$argo_token" ]; then
-        if _setup_argo "$argo_token" "$argo_protocol"; then
-            _success "Argo 隧道已启动。"
-        else
-            _warn "Argo 隧道启动失败，其余协议不受影响。"
-        fi
-    fi
-
-    _apply_firewall "$reality_port" "$reality_public" "$h3_port" "$h3_public"
-
-    echo "" >&2
-    echo -e "${GREEN}──────────── 部署完成 ────────────${NC}" >&2
-    local reality_show h3_show
-    if [ "$reality_port" = "0" ]; then reality_show="未启用"; else reality_show=$(_port_desc "$reality_port" "$reality_public"); fi
-    if [ "$h3_port" = "0" ]; then h3_show="未启用"; else h3_show=$(_port_desc "$h3_port" "$h3_public"); fi
-    echo -e "  Reality 端口 : ${reality_show}" >&2
-    if [ "$reality_port" != "0" ]; then
-        echo -e "  Reality SNI  : ${reality_sni}  (伪装目标)" >&2
-    fi
-    echo -e "  H3 端口      : ${h3_show}" >&2
-    if [ "$h3_port" != "0" ]; then
-        local cert_show="自签"
-        [ "$h3_selfsigned" = "false" ] && cert_show="自备"
-        echo -e "  H3 SNI       : ${h3_sni}  (${cert_show}证书)" >&2
-    fi
-    echo -e "  Argo 端口    : ${argo_port}  (${argo_protocol})" >&2
-    echo -e "  服务模式     : ${INIT_SYSTEM}" >&2
-
-    _show_links
-    return 0
-}
-
-_one_click_deploy() {
-    _check_root
-    _detect_init_system
-
-    if [ -s "$META_FILE" ]; then
-        _warn "检测到已存在的部署（重新部署会生成新端口与凭据）。"
-        if [ -t 0 ]; then
-            if ! _ask_yes "是否重新部署? (y/N): " n; then
-                _info "已取消，直接展示现有节点链接。"
-                _show_links
-                return $?
-            fi
-        else
-            _info "非交互环境：保留现有部署，直接输出节点链接。"
-            _show_links
-            return $?
-        fi
-    fi
-
-    local reality_port h3_port reality_public h3_public input spec
-
-    if [ -t 0 ]; then
-        read -r -p "  Reality 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
-        if ! spec=$(_parse_port_spec "$input"); then
-            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
-            spec=$(_parse_port_spec "")
-        fi
-        reality_port="${spec%% *}"; reality_public="${spec##* }"
-        _ask_reality_sni
-
-        input=""
-        read -r -p "  H3 端口      [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
-        if ! spec=$(_parse_port_spec "$input"); then
-            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
-            spec=$(_parse_port_spec "")
-        fi
-        h3_port="${spec%% *}"; h3_public="${spec##* }"
-        _ask_h3_tls
-    else
-        spec=$(_parse_port_spec "")
-        reality_port="${spec%% *}"; reality_public="${spec##* }"
-        spec=$(_parse_port_spec "")
-        h3_port="${spec%% *}"; h3_public="${spec##* }"
-        while [ "$h3_port" = "$reality_port" ]; do
-            spec=$(_parse_port_spec "")
-            h3_port="${spec%% *}"; h3_public="${spec##* }"
-        done
-    fi
-
-    # 已存在的 Argo 配置在重部署时沿用，避免掉线
-    local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
-    local argo_tunnel_id="" argo_zone_id=""
-    if [ -s "$META_FILE" ]; then
-        argo_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
-        argo_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
-        argo_protocol=$(jq -r '.argo_protocol // "http2"' "$META_FILE" 2>/dev/null)
-        argo_port=$(jq -r '.argo_port // 0' "$META_FILE" 2>/dev/null)
-        argo_tunnel_id=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
-        argo_zone_id=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
-    fi
-    [ -n "${ARGO_TOKEN:-}" ] && argo_token="$ARGO_TOKEN"
-    [ -n "${ARGO_DOMAIN:-}" ] && argo_domain="$ARGO_DOMAIN"
-    [ -n "${ARGO_PROTOCOL:-}" ] && argo_protocol="$ARGO_PROTOCOL"
-    [ -n "${ARGO_PORT:-}" ] && argo_port="$ARGO_PORT"
-
-    # 无 Argo 配置时，交互询问是否用 CF 凭据自动搭建
-    if [ -z "$argo_token" ] && [ -t 0 ]; then
-        echo "" >&2
-        if _ask_yes "  是否顺带自动搭建 Argo 隧道（用 Cloudflare 邮箱 + API Key）? (y/N): " n; then
-            if _argo_auto_setup; then
-                argo_token="$ARGO_TOKEN"
-                argo_domain="$ARGO_DOMAIN"
-                argo_protocol="$ARGO_PROTOCOL"
-                argo_port="$ARGO_PORT"
-                argo_tunnel_id="$ARGO_TUNNEL_ID"
-                argo_zone_id="$ARGO_ZONE_ID"
-            else
-                _warn "Argo 自动搭建未完成，本次只部署 Reality + H3。"
-                argo_token=""
-                argo_domain=""
-                argo_port="0"
-            fi
-        fi
-    fi
-
-    echo "" >&2
-    echo -e "${CYAN}  一键部署预览${NC}" >&2
-    echo -e "    VLESS-TCP-REALITY-Vision : 端口 ${GREEN}$(_port_desc "$reality_port" "$reality_public")${NC}" >&2
-    echo -e "    VLESS-XHTTP-H3 (UDP)     : 端口 ${GREEN}$(_port_desc "$h3_port" "$h3_public")${NC}" >&2
-    if [ -n "$argo_token" ]; then
-        echo -e "    XHTTP-Argo 隧道          : ${argo_protocol} / ${argo_domain}" >&2
-    else
-        echo -e "    XHTTP-Argo 隧道          : ${YELLOW}未启用${NC}" >&2
-    fi
-    echo "" >&2
-
-    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
-        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id" \
-        "$reality_public" "$h3_public"
-}
-
-_custom_deploy() {
-    _check_root
-    _detect_init_system
-
-    echo "" >&2
-    echo -e "${CYAN}  === 自定义部署 ===${NC}" >&2
-
-    local reality_port="0" h3_port="0" reality_public="0" h3_public="0" input="" spec
-
-    if _ask_yes "  是否部署 VLESS-TCP-REALITY-Vision? (Y/n): " y; then
-        read -r -p "  Reality 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
-        if ! spec=$(_parse_port_spec "$input"); then
-            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
-            spec=$(_parse_port_spec "")
-        fi
-        reality_port="${spec%% *}"; reality_public="${spec##* }"
-        _info "Reality 端口: $(_port_desc "$reality_port" "$reality_public")"
-        _ask_reality_sni
-    fi
-
-    input=""
-    if _ask_yes "  是否部署 XHTTP-H3 直连 (UDP)? (Y/n): " y; then
-        read -r -p "  H3 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
-        if ! spec=$(_parse_port_spec "$input"); then
-            _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
-            spec=$(_parse_port_spec "")
-        fi
-        h3_port="${spec%% *}"; h3_public="${spec##* }"
-        _info "H3 端口: $(_port_desc "$h3_port" "$h3_public")"
-        _ask_h3_tls
-    fi
-
-    local argo_token="" argo_domain="" argo_protocol="http2" argo_port="0"
-    local argo_tunnel_id="" argo_zone_id=""
-    if _ask_yes "  是否部署 XHTTP-Argo 隧道? (y/N): " n; then
-        echo "" >&2
-        echo -e "    ${GREEN}[1]${NC} 自动搭建（Cloudflare 邮箱 + Global API Key，推荐）" >&2
-        echo -e "    ${GREEN}[2]${NC} 手动填写（已有 Tunnel Token + 域名）" >&2
-        read -r -p "  请选择 [1/2] (回车 1): " input || input=""
-        case "$input" in
-            2)
-                read -r -p "  Argo 本地端口 (回车 8001): " input || input=""
-                if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
-                    argo_port="$input"
-                else
-                    argo_port="8001"
-                fi
-
-                read -r -p "  Argo 隧道协议 [http2/quic] (回车 http2): " input || input=""
-                case "${input,,}" in
-                    quic) argo_protocol="quic" ;;
-                    *) argo_protocol="http2" ;;
-                esac
-
-                read -r -p "  Cloudflare Tunnel 完整域名 (如 a.example.com): " argo_domain || argo_domain=""
-                argo_domain=$(printf '%s' "$argo_domain" | tr -d '[:space:]')
-
-                read -r -p "  Cloudflare Tunnel Token: " argo_token || argo_token=""
-                argo_token=$(printf '%s' "$argo_token" | tr -d '[:space:]')
-
-                if [ -z "$argo_domain" ] || [ -z "$argo_token" ]; then
-                    _warn "域名或 Token 为空，已跳过 Argo 部署。"
-                    argo_token=""
-                    argo_domain=""
-                    argo_port="0"
-                fi
-                ;;
-            *)
-                if _argo_auto_setup; then
-                    argo_token="$ARGO_TOKEN"
-                    argo_domain="$ARGO_DOMAIN"
-                    argo_protocol="$ARGO_PROTOCOL"
-                    argo_port="$ARGO_PORT"
-                    argo_tunnel_id="$ARGO_TUNNEL_ID"
-                    argo_zone_id="$ARGO_ZONE_ID"
-                else
-                    _warn "Argo 自动搭建未完成，已跳过。"
-                    argo_token=""
-                    argo_domain=""
-                    argo_port="0"
-                fi
-                ;;
-        esac
-    fi
-
-    if [ "$reality_port" = "0" ] && [ "$h3_port" = "0" ] && [ -z "$argo_token" ]; then
-        _error "未选择任何协议，已取消。"
-        return 1
-    fi
-
-    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
-        "$argo_domain" "$argo_token" "$argo_tunnel_id" "$argo_zone_id" \
-        "$reality_public" "$h3_public"
-}
-
-# 已部署 Reality/H3 后，单独补充/重建 Argo 隧道（自动建隧道 + DNS）
-_add_argo_only() {
-    _check_root
-    _detect_init_system
-
-    # 没有任何部署：直接创建「仅 Argo」节点（不生成 Reality / H3 直连）
-    if [ ! -s "$META_FILE" ]; then
-        echo "" >&2
-        echo -e "${CYAN}  未检测到现有部署，将创建「仅 Argo」节点。${NC}" >&2
-        echo -e "  只生成 H2-Argo / H3-Argo 两条隧道节点，不占公网端口、不需要公网 IP。" >&2
-        echo -e "  如需同时保留直连节点，请改用 ${GREEN}[1] 一键部署${NC} 并在过程中选择搭建 Argo。" >&2
-        echo "" >&2
-        if ! _ask_yes "  确认创建仅 Argo 部署? (y/N): " n; then
-            _info "已取消。"
-            return 0
-        fi
-        _install_dependencies || return 1
-        _argo_auto_setup || return 1
-        _deploy_all 0 0 "$ARGO_PROTOCOL" "$ARGO_PORT" "$ARGO_DOMAIN" "$ARGO_TOKEN" \
-            "$ARGO_TUNNEL_ID" "$ARGO_ZONE_ID"
-        return $?
-    fi
-
-    _install_dependencies || return 1
-    _install_xray_core auto || return 1
-    _install_cloudflared || return 1
-
-    _argo_auto_setup || return 1
-
-    local tmp
-    tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
-    if ! jq --arg t "$ARGO_TOKEN" --arg d "$ARGO_DOMAIN" --arg p "$ARGO_PROTOCOL" \
-        --argjson port "$ARGO_PORT" --arg tid "$ARGO_TUNNEL_ID" --arg zid "$ARGO_ZONE_ID" '
-        .argo_token = $t
-        | .argo_domain = $d
-        | .argo_protocol = $p
-        | .argo_port = $port
-        | .argo_tunnel_id = $tid
-        | .argo_zone_id = $zid
-        | .argo_path = (if (.argo_path // "") == "" then ((.uuid // "argo") + "-argo") else .argo_path end)
-    ' "$META_FILE" > "$tmp"; then
-        rm -f "$tmp"
-        _error "更新 meta.json 失败。"
-        return 1
-    fi
-    chmod 600 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
-
-    _write_config || return 1
-    _check_config || return 1
-    _manage_service restart || return 1
-    if ! _setup_argo "$ARGO_TOKEN" "$ARGO_PROTOCOL"; then
-        _error "Argo 隧道启动失败，请检查 cloudflared 日志。"
-        return 1
-    fi
-
-    _success "Argo 隧道已就绪: ${ARGO_DOMAIN}"
-    _show_links
-    return 0
-}
-
-# 删除 Argo 节点：停服务 -> 删云端隧道与 DNS -> 清 meta/本地文件 -> 重建配置并重启
 _argo_delete_node() {
     _check_root
     _detect_init_system
@@ -2259,272 +1281,18 @@ _argo_delete_node() {
     chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
 
-    # 4. 重建配置并重启（若已无其他协议则跳过）
-    remain=$(jq -r '[(.reality_port // 0), (.h3_port // 0)] | map(select(. > 0)) | length' "$META_FILE" 2>/dev/null)
-    if [ "${remain:-0}" -gt 0 ]; then
-        _write_config || return 1
-        _check_config || return 1
-        _manage_service restart || _warn "Xray 重启失败，请手动检查。"
-    else
-        _warn "已无其他协议在运行，建议直接执行 [卸载部署]。"
-    fi
+    # 4. 已无任何节点，停掉 Xray（空 inbounds 不是合法配置）
+    _info "正在停止 Xray 服务..."
+    case "$INIT_SYSTEM" in
+        systemd) systemctl stop xray >/dev/null 2>&1 || true ;;
+        openrc)  rc-service xray stop >/dev/null 2>&1 || true ;;
+        direct)  _direct_stop "$PID_FILE" "$XRAY_BIN" ;;
+    esac
 
     _success "Argo 节点已删除：云端隧道、DNS 解析、本地配置均已清理。"
-    if [ "${remain:-0}" -gt 0 ]; then
-        _show_links
-    fi
+    _info "如需彻底清理本机文件，执行菜单 [11] 卸载部署。"
     return 0
 }
-
-# SNI 基本校验：必须是纯域名（不带协议/路径/端口），否则 Reality 会握手失败
-_sni_valid() {
-    local s="${1:-}"
-    [ -n "$s" ] || return 1
-    case "$s" in */*|*:*|*" "*) return 1 ;; esac
-    case "$s" in *.*) return 0 ;; *) return 1 ;; esac
-}
-
-# 询问 Reality 的伪装目标域名（SNI），结果写入 DEPLOY_REALITY_SNI
-_ask_reality_sni() {
-    local input="" cur=""
-    if [ -s "$META_FILE" ]; then
-        cur=$(jq -r '.reality_sni // ""' "$META_FILE" 2>/dev/null | tr -d '\r')
-    fi
-    [ -n "$cur" ] || cur="$DEFAULT_REALITY_SNI"
-
-    read -r -p "  Reality SNI (伪装目标) [回车 ${cur}]: " input || input=""
-    input=$(printf '%s' "$input" | tr -d '[:space:]')
-    [ -n "$input" ] || { DEPLOY_REALITY_SNI="$cur"; return 0; }
-
-    if ! _sni_valid "$input"; then
-        _warn "SNI 应是不带 http:// 和路径的域名（如 www.apple.com），已改用 ${cur}。"
-        DEPLOY_REALITY_SNI="$cur"
-        return 0
-    fi
-    DEPLOY_REALITY_SNI="$input"
-}
-
-# 询问 H3 的 SNI 与可选自定义证书，结果写入 DEPLOY_H3_SNI / DEPLOY_H3_CERT / DEPLOY_H3_KEY
-_ask_h3_tls() {
-    local input="" keyin="" sni_given=0 cn=""
-    # 每次询问都从干净状态开始，避免上一次的证书残留影响本次部署
-    DEPLOY_H3_CERT=""
-    DEPLOY_H3_KEY=""
-
-    read -r -p "  H3 SNI [回车 ${H3_SNI}]: " input || input=""
-    input=$(printf '%s' "$input" | tr -d '[:space:]')
-    [ -n "$input" ] && sni_given=1
-    DEPLOY_H3_SNI="${input:-$H3_SNI}"
-
-    input=""
-    read -r -p "  证书 crt 路径 [回车自签]: " input || input=""
-    input=$(printf '%s' "$input" | tr -d '[:space:]')
-    [ -n "$input" ] || return 0
-    if [ ! -f "$input" ]; then
-        _warn "证书文件不存在，已改回自签证书。"
-        return 0
-    fi
-    read -r -p "  私钥 key 路径: " keyin || keyin=""
-    keyin=$(printf '%s' "$keyin" | tr -d '[:space:]')
-    if [ -f "$keyin" ]; then
-        DEPLOY_H3_CERT="$input"
-        DEPLOY_H3_KEY="$keyin"
-        _info "将使用自定义证书: ${DEPLOY_H3_CERT}"
-        # 证书域名与 SNI 不一致时客户端会校验证书失败；用户没手填 SNI 就按证书 CN 自动对齐
-        if [ "$sni_given" -eq 0 ]; then
-            cn=$(openssl x509 -in "$DEPLOY_H3_CERT" -noout -subject 2>/dev/null \
-                | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | tr -d '[:space:]')
-            if [ -n "$cn" ] && [ "$cn" != "$DEPLOY_H3_SNI" ]; then
-                DEPLOY_H3_SNI="$cn"
-                _info "已按证书 CN 自动设置 SNI: ${cn}"
-            fi
-        fi
-    else
-        _warn "私钥文件不存在，已改回自签证书。"
-    fi
-}
-
-# 单独部署 / 重部署直连协议（reality | h3），保留其它已部署协议不受影响
-_deploy_single_proto() {
-    local kind="$1"
-    _check_root
-    _detect_init_system
-
-    local reality_port=0 reality_public=0 h3_port=0 h3_public=0
-    local argo_port=0 argo_domain="" argo_protocol="http2" argo_token="" tid="" zid=""
-    if [ -s "$META_FILE" ]; then
-        IFS=$'\x1f' read -r reality_port reality_public h3_port h3_public argo_port argo_domain argo_protocol argo_token tid zid < <(
-            jq -r '[((.reality_port // 0) | tostring),
-                    ((.reality_public_port // .reality_port // 0) | tostring),
-                    ((.h3_port // 0) | tostring),
-                    ((.h3_public_port // .h3_port // 0) | tostring),
-                    ((.argo_port // 0) | tostring),
-                    (.argo_domain // ""), (.argo_protocol // "http2"),
-                    (.argo_token // ""), (.argo_tunnel_id // ""), (.argo_zone_id // "")]
-                   | join("\u001f")' "$META_FILE" 2>/dev/null
-        )
-    fi
-
-    local label input spec listen pub
-    case "$kind" in
-        reality) label="Reality" ;;
-        h3)      label="H3" ;;
-        *)       _error "未知协议: ${kind}"; return 1 ;;
-    esac
-
-    echo "" >&2
-    if [ "$kind" = "reality" ] && [ "${reality_port:-0}" != "0" ]; then
-        _warn "Reality 已在运行（$(_port_desc "$reality_port" "$reality_public")），重新部署会更换端口。"
-    fi
-    if [ "$kind" = "h3" ] && [ "${h3_port:-0}" != "0" ]; then
-        _warn "H3 已在运行（$(_port_desc "$h3_port" "$h3_public")），重新部署会更换端口。"
-    fi
-
-    read -r -p "  ${label} 端口 [内部:暴露，单填内外统一，回车随机 30000-50000]: " input || input=""
-    if ! spec=$(_parse_port_spec "$input"); then
-        _warn "端口格式无效（应写 443 或 443:31000），已改用随机端口。"
-        spec=$(_parse_port_spec "")
-    fi
-    listen="${spec%% *}"; pub="${spec##* }"
-
-    # H3 需要证书与 SNI；Reality 只需要伪装目标域名
-    if [ "$kind" = "h3" ]; then
-        _ask_h3_tls
-    else
-        _ask_reality_sni
-    fi
-
-    if [ "$kind" = "reality" ]; then
-        reality_port="$listen"; reality_public="$pub"
-        [ "${h3_port:-0}" != "0" ] && _info "保留现有 H3: $(_port_desc "$h3_port" "$h3_public")"
-    else
-        h3_port="$listen"; h3_public="$pub"
-        [ "${reality_port:-0}" != "0" ] && _info "保留现有 Reality: $(_port_desc "$reality_port" "$reality_public")"
-    fi
-
-    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" \
-        "$argo_domain" "$argo_token" "$tid" "$zid" "$reality_public" "$h3_public"
-}
-
-# 删除单个直连协议（reality | h3）
-_remove_protocol() {
-    local kind="$1" label tmp remain
-    case "$kind" in
-        reality) label="Reality Vision" ;;
-        h3)      label="H3 直连" ;;
-        *)       _error "未知协议: ${kind}"; return 1 ;;
-    esac
-
-    if ! _ask_yes "  确认删除 ${label}? (y/N): " n; then
-        _info "已取消。"
-        return 0
-    fi
-
-    tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
-    if [ "$kind" = "reality" ]; then
-        if ! jq '.reality_port = 0 | .reality_public_port = 0
-                 | .reality_private_key = "" | .reality_public_key = "" | .reality_short_id = ""' \
-                "$META_FILE" > "$tmp"; then
-            rm -f "$tmp"
-            _error "更新 meta.json 失败。"
-            return 1
-        fi
-    else
-        if ! jq '.h3_port = 0 | .h3_public_port = 0 | .h3_path = ""' "$META_FILE" > "$tmp"; then
-            rm -f "$tmp"
-            _error "更新 meta.json 失败。"
-            return 1
-        fi
-    fi
-    chmod 600 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
-
-    remain=$(jq -r '[(.reality_port // 0), (.h3_port // 0),
-                     (if ((.argo_token // "") != "") then 1 else 0 end)]
-                    | map(select(. > 0)) | length' "$META_FILE" 2>/dev/null)
-    if [ "${remain:-0}" -gt 0 ]; then
-        _write_config || return 1
-        _check_config || return 1
-        _manage_service restart || _warn "Xray 重启失败，请手动检查。"
-        _success "${label} 已删除。"
-        _show_links
-    else
-        _warn "所有节点已删除，正在停止 Xray 服务..."
-        _manage_service stop >/dev/null 2>&1 || true
-        _success "已清空所有节点（配置文件仍保留在 ${XRAY_DIR}）"
-    fi
-    return 0
-}
-
-# 删除节点子菜单：Reality / H3 / Argo
-_delete_node_menu() {
-    _check_root
-    _detect_init_system
-
-    if [ ! -s "$META_FILE" ]; then
-        _error "尚未部署，没有可删除的节点。"
-        return 1
-    fi
-
-    while true; do
-        local rp rpub hp hpub ap adom choice
-        IFS=$'\x1f' read -r rp rpub hp hpub ap adom < <(
-            jq -r '[((.reality_port // 0) | tostring),
-                    ((.reality_public_port // .reality_port // 0) | tostring),
-                    ((.h3_port // 0) | tostring),
-                    ((.h3_public_port // .h3_port // 0) | tostring),
-                    ((.argo_port // 0) | tostring),
-                    (.argo_domain // "")]
-                   | join("\u001f")' "$META_FILE" 2>/dev/null
-        )
-
-        echo "" >&2
-        echo -e "${CYAN}  === 删除节点 ===${NC}" >&2
-        if [ "${rp:-0}" != "0" ]; then
-            echo -e "    ${RED}[1]${NC} Reality Vision   $(_port_desc "$rp" "$rpub")" >&2
-        else
-            echo -e "    ${YELLOW}[1]${NC} Reality Vision   未部署${NC}" >&2
-        fi
-        if [ "${hp:-0}" != "0" ]; then
-            echo -e "    ${RED}[2]${NC} H3 直连          $(_port_desc "$hp" "$hpub")" >&2
-        else
-            echo -e "    ${YELLOW}[2]${NC} H3 直连          未部署${NC}" >&2
-        fi
-        if [ "${ap:-0}" != "0" ] && [ -n "${adom:-}" ]; then
-            echo -e "    ${RED}[3]${NC} Argo 隧道        ${adom}" >&2
-            echo -e "        ${YELLOW}(含云端隧道 + DNS 解析)${NC}" >&2
-        else
-            echo -e "    ${YELLOW}[3]${NC} Argo 隧道        未部署${NC}" >&2
-        fi
-        echo -e "    ${GREEN}[0]${NC} 返回" >&2
-        echo "" >&2
-
-        read -r -p "  请选择 [0-3]: " choice || return 0
-        case "$choice" in
-            1)
-                [ "${rp:-0}" = "0" ] && { _warn "Reality 未部署。"; continue; }
-                _remove_protocol reality
-                ;;
-            2)
-                [ "${hp:-0}" = "0" ] && { _warn "H3 未部署。"; continue; }
-                _remove_protocol h3
-                ;;
-            3)
-                if [ "${ap:-0}" = "0" ] || [ -z "${adom:-}" ]; then
-                    _warn "Argo 未部署。"
-                    continue
-                fi
-                _argo_delete_node
-                ;;
-            0 | "") return 0 ;;
-            *) _error "无效输入。" ;;
-        esac
-    done
-}
-
-# ==============================================================================
-#  维护
-# ==============================================================================
 
 _view_log() {
     if [ -s "$LOG_FILE" ]; then
@@ -2548,121 +1316,6 @@ _view_argo_log() {
         _info "按 Ctrl+C 退出日志查看 (${ARGO_LOG_FILE})。"
         tail -f "$ARGO_LOG_FILE"
     fi
-}
-
-_show_status() {
-    local ver="未安装"
-    [ -x "$XRAY_BIN" ] && ver=$("$XRAY_BIN" version 2>/dev/null | head -n1)
-
-    echo "" >&2
-    echo -e "${CYAN}  ───── 运行状态 ─────${NC}" >&2
-    echo -e "  系统环境 : $(uname -s) $(uname -m)  |  服务模式: ${INIT_SYSTEM}" >&2
-    echo -e "  脚本版本 : ${GREEN}$(_version_full)${NC}" >&2
-    echo -e "  核心版本 : ${ver}" >&2
-
-    if _service_is_running; then
-        echo -e "  Xray     : ${GREEN}● 运行中${NC}" >&2
-    else
-        echo -e "  Xray     : ${RED}○ 已停止${NC}" >&2
-    fi
-
-    if [ -x "$CLOUDFLARED_BIN" ]; then
-        local argo_run=false
-        case "$INIT_SYSTEM" in
-            systemd) systemctl is-active --quiet xray-argo 2>/dev/null && argo_run=true ;;
-            openrc) rc-service xray-argo status 2>/dev/null | grep -q started && argo_run=true ;;
-            direct) _is_pid_file_running_cmd "$ARGO_PID_FILE" "$CLOUDFLARED_BIN" && argo_run=true ;;
-        esac
-        if [ "$argo_run" = true ]; then
-            echo -e "  Argo     : ${GREEN}● 运行中${NC}" >&2
-        else
-            echo -e "  Argo     : ${YELLOW}○ 已安装 (未运行)${NC}" >&2
-        fi
-    else
-        echo -e "  Argo     : ${RED}○ 未安装${NC}" >&2
-    fi
-
-    # Argo 隧道实际传输（UDP/QUIC 还是 TCP/HTTP2）
-    if [ -s "$META_FILE" ] && [ "$(jq -r '.argo_port // 0' "$META_FILE" 2>/dev/null)" != "0" ]; then
-        local st
-        st=$(_argo_transport 2>/dev/null | cut -d$'\x1f' -f1)
-        case "$st" in
-            quic)     echo -e "  Argo 传输: ${GREEN}QUIC (UDP)${NC}" >&2 ;;
-            http2)    echo -e "  Argo 传输: ${YELLOW}HTTP/2 (TCP)${NC}" >&2 ;;
-            fallback) echo -e "  Argo 传输: ${RED}QUIC 已回退 HTTP/2${NC}" >&2 ;;
-            *)        echo -e "  Argo 传输: ${YELLOW}未知${NC}" >&2 ;;
-        esac
-    fi
-
-    if [ -s "$META_FILE" ]; then
-        echo -e "  端口     : $(jq -r '
-            def fmt(l; pub): if ((pub // 0) == 0) or (pub == l) then "\(l)" else "\(l)→\(pub)" end;
-            [
-            (if (.reality_port // 0) > 0 then "Reality=" + fmt(.reality_port; .reality_public_port) else empty end),
-            (if (.h3_port // 0) > 0 then "H3=" + fmt(.h3_port; .h3_public_port) else empty end),
-            (if (.argo_port // 0) > 0 and (.argo_token // "") != "" then "Argo=\(.argo_port)" else empty end)
-        ] | join("  ")' "$META_FILE" 2>/dev/null)" >&2
-        echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
-        local rs h3s
-        rs=$(jq -r 'if (.reality_port // 0) > 0 then (.reality_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
-        h3s=$(jq -r 'if (.h3_port // 0) > 0 then (.h3_sni // "") else empty end' "$META_FILE" 2>/dev/null | tr -d '\r')
-        [ -n "$rs" ] && echo -e "  Reality SNI  : ${rs}" >&2
-        [ -n "$h3s" ] && echo -e "  H3 SNI       : ${h3s}" >&2
-    else
-        echo -e "  端口     : ${YELLOW}尚未部署${NC}" >&2
-    fi
-    echo "" >&2
-}
-
-# 由 meta.json 重建 config.json 并重启：端口 / 密钥 / 节点链接都不变
-# 用于「改了脚本里的配置模板」这类修复（例如 Argo inbound 的 sockopt），不必重新部署
-_rebuild_config() {
-    _check_root
-    _detect_init_system
-
-    if [ ! -s "$META_FILE" ]; then
-        _error "尚未部署，没有可重建的配置。"
-        return 1
-    fi
-    if ! command -v jq >/dev/null 2>&1; then
-        _error "缺少 jq，无法由 meta.json 重建配置。"
-        return 1
-    fi
-
-    _info "正在由 meta.json 重建 config.json..."
-    local bak=""
-    if [ -s "$CONFIG_FILE" ]; then
-        bak="${CONFIG_FILE}.bak.$$"
-        cp -f "$CONFIG_FILE" "$bak" 2>/dev/null || bak=""
-    fi
-
-    if ! _write_config; then
-        [ -n "$bak" ] && mv -f "$bak" "$CONFIG_FILE"
-        _error "重建失败，已保留原配置。"
-        return 1
-    fi
-    if ! _check_config; then
-        if [ -n "$bak" ]; then
-            mv -f "$bak" "$CONFIG_FILE"
-            _warn "新配置未通过校验，已恢复原配置。"
-        else
-            _error "新配置未通过校验。"
-        fi
-        return 1
-    fi
-    [ -n "$bak" ] && rm -f "$bak"
-
-    if _service_is_running; then
-        _info "正在重启 Xray 服务..."
-        if ! _manage_service restart; then
-            _error "重启失败，请查看日志: ${LOG_FILE}"
-            return 1
-        fi
-        _success "配置已重建并重启，端口与节点链接保持不变。"
-    else
-        _info "服务当前未运行，配置已更新，下次启动生效。"
-    fi
-    return 0
 }
 
 _service_menu() {
@@ -2706,93 +1359,6 @@ _update_core() {
             return 1
         fi
     fi
-    return 0
-}
-
-_uninstall_deploy() {
-    _check_root
-    _detect_init_system
-
-    local cloud_tid="" cloud_zid="" cloud_domain="" cloud_token=""
-    if [ -s "$META_FILE" ]; then
-        if command -v jq >/dev/null 2>&1; then
-            cloud_tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
-            cloud_zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
-            cloud_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
-            cloud_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
-        else
-            _warn "未安装 jq，读不到 Argo 隧道信息；云端隧道与 DNS 需手动在 Cloudflare 控制台删除。"
-        fi
-    fi
-
-    echo "" >&2
-    echo -e "${RED}  即将删除以下内容：${NC}" >&2
-    echo -e "    - Xray 服务与 Argo 隧道服务" >&2
-    echo -e "    - 配置目录: ${XRAY_DIR}（含配置、证书、密钥、cloudflared、CF 凭据）" >&2
-    echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
-    echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
-    local self_cmd="$SELF_BIN"
-    [ -f "$self_cmd" ] && echo -e "    - 管理命令: ${self_cmd}" >&2
-    if [ -n "$cloud_tid" ]; then
-        echo -e "    - ${YELLOW}Cloudflare 云端隧道 ${cloud_tid}${NC}" >&2
-        [ -n "$cloud_domain" ] && echo -e "    - ${YELLOW}DNS 解析记录 ${cloud_domain}${NC}" >&2
-    elif [ -n "$cloud_token" ]; then
-        echo -e "    - ${YELLOW}注意：该 Argo 为手动 Token 部署，云端隧道需手动删除${NC}" >&2
-    fi
-    echo "" >&2
-
-    if ! _ask_yes "  确认卸载以上全部内容? (y/N): " n; then
-        _info "已取消卸载。"
-        return 0
-    fi
-
-    _info "正在停止服务..."
-    _stop_all_services
-
-    # 先清理云端（需要在删除凭据文件之前完成）
-    if [ -n "$cloud_tid" ]; then
-        _argo_auto_cleanup "$cloud_tid" "$cloud_zid" "$cloud_domain"
-    elif [ -n "$cloud_token" ]; then
-        _warn "未记录隧道 ID（手动 Token 部署），跳过云端清理，请手动在 Cloudflare 控制台删除隧道与 DNS。"
-    fi
-
-    # 无条件清理所有托管痕迹：不依赖 INIT_SYSTEM 判定，避免容器/混合环境残留 unit
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl disable --now xray-argo >/dev/null 2>&1 || true
-        systemctl disable --now xray >/dev/null 2>&1 || true
-    fi
-    rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray-argo.service
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl reset-failed xray xray-argo >/dev/null 2>&1 || true
-    fi
-
-    if command -v rc-service >/dev/null 2>&1; then
-        rc-service xray-argo stop >/dev/null 2>&1 || true
-        rc-service xray stop >/dev/null 2>&1 || true
-    fi
-    if command -v rc-update >/dev/null 2>&1; then
-        rc-update del xray-argo default >/dev/null 2>&1 || true
-        rc-update del xray default >/dev/null 2>&1 || true
-    fi
-    rm -f /etc/init.d/xray /etc/init.d/xray-argo
-
-    _info "正在清理文件..."
-    rm -rf "$XRAY_DIR" "$RUNTIME_DIR"
-    rm -f "$LOG_FILE" "$ARGO_LOG_FILE"
-
-    # 管理命令一并删除：确认时已列在清单里，不再二次询问
-    if [ -f "$self_cmd" ]; then
-        rm -f "$self_cmd" 2>/dev/null \
-            && _success "管理命令已删除: ${self_cmd}" \
-            || _warn "删除 ${self_cmd} 失败，请手动执行 rm -f ${self_cmd}"
-    fi
-
-    _success "Xray-go 已卸载完成。"
-    echo -e "  ${CYAN}当前终端里的 xg 进程还在内存中，退出后 xg 命令即不可用。${NC}" >&2
-    echo -e "  如需重新部署: ${CYAN}bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)${NC}" >&2
-    # 标记已卸载，调用方据此直接退出，不再回主菜单
-    XG_UNINSTALLED=1
     return 0
 }
 
@@ -2862,141 +1428,542 @@ _update_script() {
     return 0
 }
 
-# ==============================================================================
-#  兼容旧版参数
-# ==============================================================================
+_uninstall_deploy() {
+    _check_root
+    _detect_init_system
 
-_legacy_deploy() {
-    local ARG_H3="" ARG_REALITY="" ARG_ARGO_PROTOCOL="quic" ARG_ARGO_PORT="8001"
-    local ARG_ARGO_DOMAIN="" ARG_ARGO_TOKEN="" arg clean_arg
-
-    for arg in "$@"; do
-        clean_arg="${arg//\"/}"
-        clean_arg="${clean_arg//\'/}"
-
-        if [[ "$clean_arg" =~ ^[hH]3(.*)$ ]]; then
-            ARG_H3="${BASH_REMATCH[1]}"
-        elif [[ "$clean_arg" =~ ^[rR][eE][aA][lL][iI][tT][yY](.*)$ ]]; then
-            ARG_REALITY="${BASH_REMATCH[1]}"
-        elif [[ "$clean_arg" =~ ^argo[pP][rR][oO][tT][oO][cC][oO][lL](.*)$ ]] || [[ "$clean_arg" =~ ^[pP][rR][oO][tT][oO][cC][oO][lL](.*)$ ]]; then
-            ARG_ARGO_PROTOCOL="${BASH_REMATCH[1]}"
-        elif [[ "$clean_arg" =~ ^argo[pP][oO][rR][tT](.*)$ ]] || [[ "$clean_arg" =~ ^[pP][oO][rR][tT](.*)$ ]]; then
-            ARG_ARGO_PORT="${BASH_REMATCH[1]}"
-        elif [[ "$clean_arg" =~ ^argo[dD][oO][mM][aA][iI][nN](.*)$ ]] || [[ "$clean_arg" =~ ^[dD][oO][mM][aA][iI][nN](.*)$ ]]; then
-            ARG_ARGO_DOMAIN="${BASH_REMATCH[1]}"
-        elif [[ "$clean_arg" =~ ^argo[tT][oO][kK][eE][nN](.*)$ ]] || [[ "$clean_arg" =~ ^[tT][oO][kK][eE][nN](.*)$ ]]; then
-            ARG_ARGO_TOKEN="${BASH_REMATCH[1]}"
-        elif [[ "$clean_arg" =~ ^[0-9]+$ ]] || [[ "$clean_arg" =~ ^[yYnN]$ ]]; then
-            if [ -z "$ARG_H3" ]; then
-                ARG_H3="$clean_arg"
-            elif [ -z "$ARG_REALITY" ]; then
-                ARG_REALITY="$clean_arg"
-            fi
+    local cloud_tid="" cloud_zid="" cloud_domain="" cloud_token=""
+    if [ -s "$META_FILE" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            cloud_tid=$(jq -r '.argo_tunnel_id // ""' "$META_FILE" 2>/dev/null)
+            cloud_zid=$(jq -r '.argo_zone_id // ""' "$META_FILE" 2>/dev/null)
+            cloud_domain=$(jq -r '.argo_domain // ""' "$META_FILE" 2>/dev/null)
+            cloud_token=$(jq -r '.argo_token // ""' "$META_FILE" 2>/dev/null)
+        else
+            _warn "未安装 jq，读不到 Argo 隧道信息；云端隧道与 DNS 需手动在 Cloudflare 控制台删除。"
         fi
-    done
-
-    _parse_port() {
-        local input="$1"
-        [ -z "$input" ] && { echo ""; return; }
-        case "$input" in
-            n | N) echo "" ;;
-            y | Y) _rand_port ;;
-            *)
-                if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 65535 ]; then
-                    echo "$input"
-                else
-                    echo ""
-                fi
-                ;;
-        esac
-    }
-
-    local h3_port reality_port
-    h3_port=$(_parse_port "$ARG_H3")
-    reality_port=$(_parse_port "$ARG_REALITY")
-
-    local argo_port="$ARG_ARGO_PORT" argo_token="$ARG_ARGO_TOKEN" argo_domain="$ARG_ARGO_DOMAIN"
-    local argo_protocol="${ARG_ARGO_PROTOCOL:-quic}"
-
-    if [ -z "$argo_port" ] || [ -z "$argo_domain" ] || [ -z "$argo_token" ]; then
-        argo_token=""
-        argo_domain=""
-        argo_port="0"
     fi
 
-    if [ -z "$h3_port" ] && [ -z "$reality_port" ] && [ -z "$argo_token" ]; then
-        _warn "未检测到有效参数（H3、Reality 及 Argo 均未启用）。"
-        _info "如需交互式部署，请不带参数运行本脚本。"
+    echo "" >&2
+    echo -e "${RED}  即将删除以下内容：${NC}" >&2
+    echo -e "    - Xray 服务与 Argo 隧道服务" >&2
+    echo -e "    - 配置目录: ${XRAY_DIR}（含配置、cloudflared、CF 凭据）" >&2
+    echo -e "    - 日志: ${LOG_FILE} / ${ARGO_LOG_FILE}" >&2
+    echo -e "    - 运行目录: ${RUNTIME_DIR}" >&2
+    local self_cmd="$SELF_BIN"
+    [ -f "$self_cmd" ] && echo -e "    - 管理命令: ${self_cmd}" >&2
+    if [ -n "$cloud_tid" ]; then
+        echo -e "    - ${YELLOW}Cloudflare 云端隧道 ${cloud_tid}${NC}" >&2
+        [ -n "$cloud_domain" ] && echo -e "    - ${YELLOW}DNS 解析记录 ${cloud_domain}${NC}" >&2
+    elif [ -n "$cloud_token" ]; then
+        echo -e "    - ${YELLOW}注意：该 Argo 为手动 Token 部署，云端隧道需手动删除${NC}" >&2
+    fi
+    echo "" >&2
+
+    if ! _ask_yes "  确认卸载以上全部内容? (y/N): " n; then
+        _info "已取消卸载。"
         return 0
     fi
 
-    _deploy_all "$reality_port" "$h3_port" "$argo_protocol" "$argo_port" "$argo_domain" "$argo_token"
+    _info "正在停止服务..."
+    _stop_all_services
+
+    # 先清理云端（需要在删除凭据文件之前完成）
+    if [ -n "$cloud_tid" ]; then
+        _argo_auto_cleanup "$cloud_tid" "$cloud_zid" "$cloud_domain"
+    elif [ -n "$cloud_token" ]; then
+        _warn "未记录隧道 ID（手动 Token 部署），跳过云端清理，请手动在 Cloudflare 控制台删除隧道与 DNS。"
+    fi
+
+    # 无条件清理所有托管痕迹：不依赖 INIT_SYSTEM 判定，避免容器/混合环境残留 unit
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now xray-argo >/dev/null 2>&1 || true
+        systemctl disable --now xray >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray-argo.service
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed xray xray-argo >/dev/null 2>&1 || true
+    fi
+
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service xray-argo stop >/dev/null 2>&1 || true
+        rc-service xray stop >/dev/null 2>&1 || true
+    fi
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del xray-argo default >/dev/null 2>&1 || true
+        rc-update del xray default >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/init.d/xray /etc/init.d/xray-argo
+
+    _info "正在清理文件..."
+    rm -rf "$XRAY_DIR" "$RUNTIME_DIR"
+    rm -f "$LOG_FILE" "$ARGO_LOG_FILE"
+
+    # 管理命令一并删除：确认时已列在清单里，不再二次询问
+    if [ -f "$self_cmd" ]; then
+        rm -f "$self_cmd" 2>/dev/null \
+            && _success "管理命令已删除: ${self_cmd}" \
+            || _warn "删除 ${self_cmd} 失败，请手动执行 rm -f ${self_cmd}"
+    fi
+
+    _success "Xray-go 已卸载完成。"
+    echo -e "  ${CYAN}当前终端里的 xg 进程还在内存中，退出后 xg 命令即不可用。${NC}" >&2
+    echo -e "  如需重新部署: ${CYAN}bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)${NC}" >&2
+    # 标记已卸载，调用方据此直接退出，不再回主菜单
+    XG_UNINSTALLED=1
+    return 0
 }
 
-# ==============================================================================
-#  主菜单
-# ==============================================================================
+# 由 meta.json 生成 config.json（只有 Argo 一个 inbound，单一数据源，可随时重建）
+_build_config_from_meta() {
+    jq --arg logfile "$LOG_FILE" '
+        . as $m
+        | {
+            log: {loglevel: "warning", error: $logfile},
+            inbounds: ([
+                (if ((($m.argo_port // 0) > 0) and (($m.argo_token // "") != "")) then {
+                    tag: "xhttp-argo",
+                    listen: "127.0.0.1",
+                    port: ($m.argo_port | tonumber),
+                    protocol: "vless",
+                    settings: {
+                        clients: [{id: $m.uuid}],
+                        decryption: "none"
+                    },
+                    streamSettings: {
+                        network: "xhttp",
+                        security: "none",
+                        xhttpSettings: {path: ("/" + ($m.argo_path // "argo")), mode: "auto"},
+                        # cloudflared 会带 X-Forwarded-For；不声明信任来源时核心每次请求都刷一条 Warning
+                        # 这个 inbound 只监听 127.0.0.1，信任本机回环是安全的
+                        sockopt: {trustedXForwardedFor: ["127.0.0.1/32", "::1/128"]}
+                    },
+                    sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false}
+                } else empty end)
+            ]),
+            outbounds: [{tag: "direct", protocol: "freedom"}]
+        }
+    ' "$META_FILE"
+}
+
+
+# Argo 隧道进程是否在跑（三种托管模式统一判断）
+_argo_is_running() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet xray-argo 2>/dev/null ;;
+        openrc)  rc-service xray-argo status 2>/dev/null | grep -q started ;;
+        direct)  _is_pid_file_running_cmd "$ARGO_PID_FILE" "$CLOUDFLARED_BIN" ;;
+        *)       return 1 ;;
+    esac
+}
+
+
+# 连通性自检：环境 / 隧道 / Argo 传输 / 日志 / 结论
+_diag() {
+    _check_root
+    _detect_init_system
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 环境 ════════${NC}" >&2
+    echo -e "  脚本版本 : $(_version_full)" >&2
+    local core_ver="未安装"
+    [ -x "$XRAY_BIN" ] && core_ver=$("$XRAY_BIN" version 2>/dev/null | head -n1)
+    echo -e "  核心版本 : ${core_ver}" >&2
+    echo -e "  服务模式 : ${INIT_SYSTEM}" >&2
+    if _service_is_running; then
+        echo -e "  Xray     : ${GREEN}运行中${NC}" >&2
+    else
+        echo -e "  Xray     : ${RED}已停止${NC}" >&2
+    fi
+    if _argo_is_running; then
+        echo -e "  Argo     : ${GREEN}运行中${NC}" >&2
+    else
+        echo -e "  Argo     : ${RED}未运行${NC}" >&2
+    fi
+
+    if [ ! -s "$META_FILE" ]; then
+        _warn "尚未部署，无法继续自检。"
+        return 1
+    fi
+
+    local ap adom aproto
+    IFS=$'\x1f' read -r ap adom aproto < <(
+        jq -r '[((.argo_port // 0) | tostring), (.argo_domain // ""), (.argo_protocol // "")]
+               | join("\u001f")' "$META_FILE" 2>/dev/null | tr -d '\r'
+    )
+
+    if [ "${ap:-0}" = "0" ] || [ -z "${adom:-}" ]; then
+        _warn "尚未配置 Argo 隧道。"
+        return 1
+    fi
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 隧道 ════════${NC}" >&2
+    echo -e "  域名     : ${adom}" >&2
+    echo -e "  隧道协议 : ${aproto:-未记录}" >&2
+    echo -e "  本地监听 : 127.0.0.1:${ap}   TCP:$(_listen_check "${ap}" t)" >&2
+
+    local at_state="" at_cfg="" at_udp=0 at_tcp=0 at_log="" xff=0
+    IFS=$'\x1f' read -r at_state at_cfg at_udp at_tcp at_log < <(_argo_transport)
+    echo "" >&2
+    echo -e "${CYAN}════════ Argo 传输（UDP / QUIC）════════${NC}" >&2
+    echo -e "  配置协议 : ${at_cfg:-未记录}   （cloudflared --protocol）" >&2
+    echo -e "  日志协议 : ${at_log:-未采集到}   （protocol=xxx）" >&2
+    echo -e "  边缘连接 : UDP ${at_udp:-0} 条 / TCP ${at_tcp:-0} 条   （端口 7844）" >&2
+    case "$at_state" in
+        quic)     echo -e "  实际传输 : ${GREEN}QUIC（UDP）${NC}" >&2 ;;
+        http2)    echo -e "  实际传输 : ${YELLOW}HTTP/2（TCP）${NC}" >&2 ;;
+        fallback) echo -e "  实际传输 : ${RED}已从 QUIC 回退到 HTTP/2${NC}" >&2 ;;
+        *)        echo -e "  实际传输 : ${YELLOW}无法判定${NC}（服务未运行或日志为空）" >&2 ;;
+    esac
+
+    # cloudflared 每个请求都带 X-Forwarded-For；核心没声明信任来源就刷 Warning（无害但很吵）
+    [ -s "$LOG_FILE" ] && xff=$(grep -c 'trustedXForwardedFor' "$LOG_FILE" 2>/dev/null)
+    xff=${xff:-0}
+    if [ "$xff" -gt 0 ] 2>/dev/null; then
+        echo -e "  XFF 警告 : ${xff} 条（不影响使用，仅刷日志）" >&2
+    fi
+
+    echo "" >&2
+    echo -e "${CYAN}════════ Xray 日志（末 10 行）════════${NC}" >&2
+    tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/  /' >&2 || echo "  (无日志)" >&2
+
+    echo "" >&2
+    echo -e "${CYAN}════════ 结论 ════════${NC}" >&2
+    local issues=0
+
+    if [ "$(_listen_check "${ap}" t)" = "否" ]; then
+        issues=$((issues + 1))
+        _error "Xray 没有在 127.0.0.1:${ap} 监听 —— cloudflared 转进来的流量无处可去。"
+        echo -e "     处理：菜单 [8] 重建配置，或查看 ${LOG_FILE}。" >&2
+    fi
+    if ! _service_is_running; then
+        issues=$((issues + 1))
+        _error "Xray 服务未运行，节点一定不通。"
+        echo -e "     处理：菜单 [4] 服务控制 → 启动。" >&2
+    fi
+    if ! _argo_is_running; then
+        issues=$((issues + 1))
+        _error "cloudflared 未运行，Cloudflare 边缘无法把流量送到本机。"
+        echo -e "     处理：菜单 [4] 服务控制 → 重启 Argo 隧道，或看 ${ARGO_LOG_FILE}。" >&2
+    fi
+
+    case "$at_state" in
+        fallback)
+            issues=$((issues + 1))
+            _warn "Argo 隧道已从 QUIC 回退到 HTTP/2 —— 本机到 Cloudflare 的 UDP 7844 不通。" >&2
+            echo -e "     此时客户端用 H3-Argo 链接，第一跳是 UDP，但隧道这一跳已经是 TCP。" >&2
+            echo -e "     处理：换网络/换机器，或直接改用 H2-Argo 链接（更稳）。" >&2
+            ;;
+        http2)
+            if [ "$at_cfg" = "quic" ]; then
+                issues=$((issues + 1))
+                _warn "配置是 quic，但只有 TCP 连接 —— UDP 不通，已回退 HTTP/2。" >&2
+            else
+                echo -e "  ${CYAN}Argo 隧道走 HTTP/2（TCP）${NC}：http2 模式的正常表现。" >&2
+                echo -e "     想要全段 UDP：重部署时选 quic，客户端再用 H3-Argo 链接。" >&2
+            fi
+            ;;
+        quic)
+            echo -e "  ${GREEN}Argo 隧道走 QUIC（UDP 7844）${NC}：客户端用 H3-Argo 链接即为全段 UDP。" >&2
+            ;;
+    esac
+
+    if [ "${xff:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "  ${CYAN}X-Forwarded-For 警告${NC}：Argo 每个请求都会带该头，核心未声明信任来源时会刷日志。" >&2
+        echo -e "     无害，不影响连通性。消除办法：${CYAN}xg rebuild${NC}（新版模板已给 Argo inbound 加 sockopt.trustedXForwardedFor）。" >&2
+    fi
+
+    [ "$issues" -eq 0 ] && echo -e "  ${GREEN}未发现服务端明显异常${NC}" >&2
+
+    echo "" >&2
+    return 0
+}
+
+
+# 生成 H2-Argo / H3-Argo 两条节点链接
+_show_links() {
+    [ -s "$META_FILE" ] || { _error "尚未部署，请先执行 [1] 部署 Argo 隧道。"; return 1; }
+
+    local uuid argo_port argo_path argo_domain argo_protocol
+    # 用 \x1f(US) 分隔：制表符属于空白字符，连续出现会被 read 合并，导致空字段错位
+    IFS=$'\x1f' read -r uuid argo_port argo_path argo_domain argo_protocol < <(
+        jq -r '[.uuid // "", ((.argo_port // 0) | tostring), (.argo_path // ""),
+                (.argo_domain // ""), (.argo_protocol // "")]
+               | join("\u001f")' "$META_FILE" 2>/dev/null | tr -d '\r'
+    )
+
+    if [ -z "$uuid" ]; then
+        _error "元数据缺失，无法生成节点链接。"
+        return 1
+    fi
+    if [ -z "$argo_domain" ] || [ "${argo_port:-0}" = "0" ]; then
+        _error "未找到 Argo 节点，请先执行 [1] 部署。"
+        return 1
+    fi
+
+    local isp
+    isp=$(_isp_tag)
+
+    local lines=()
+    lines+=("vless://${uuid}@${CF_ADDR_H2}:${CF_PORT}?encryption=none&security=tls&alpn=h2&sni=${argo_domain}&fp=chrome&type=xhttp&mode=auto&host=${argo_domain}&path=/${argo_path}#${isp}%20H2-Argo%20XHTTP")
+    lines+=("vless://${uuid}@${CF_ADDR_H3}:${CF_PORT}?encryption=none&security=tls&alpn=h3&sni=${argo_domain}&fp=chrome&type=xhttp&mode=auto&host=${argo_domain}&path=/${argo_path}#${isp}%20H3-Argo%20XHTTP")
+
+    printf '%s\n' "${lines[@]}" > "$LINKS_FILE" 2>/dev/null || true
+    chmod 600 "$LINKS_FILE" 2>/dev/null || true
+
+    local base64_str
+    base64_str=$(printf '%s\n' "${lines[@]}" | base64 2>/dev/null | tr -d '\n\r')
+
+    echo "" >&2
+    echo -e "${GREEN}════════════════════ 节点链接 ════════════════════${NC}" >&2
+    local l
+    for l in "${lines[@]}"; do
+        echo -e "${CYAN}${l}${NC}" >&2
+    done
+    echo "" >&2
+    echo -e "${GREEN}════════════════════ 订阅内容 ════════════════════${NC}" >&2
+    echo -e "${YELLOW}${base64_str}${NC}" >&2
+    echo -e "${GREEN}══════════════════════════════════════════════════${NC}" >&2
+    echo -e "链接已保存: ${LINKS_FILE}（含明文凭据，权限 600）" >&2
+    echo -e "${YELLOW}提示${NC}: H3-Argo 走 UDP（快、抗 QoS）；网络封 UDP 时用 H2-Argo。" >&2
+    echo "" >&2
+    return 0
+}
+
+
+# 部署 / 重新部署 Argo 隧道（唯一部署入口）
+_deploy_argo() {
+    _check_root
+    _detect_init_system
+
+    # 老版本 meta 里可能还留着 Reality / H3：本版本只维护 Argo
+    if [ -s "$META_FILE" ]; then
+        local legacy
+        legacy=$(jq -r '[(.reality_port // 0), (.h3_port // 0)] | map(select(. > 0)) | length' "$META_FILE" 2>/dev/null)
+        if [ "${legacy:-0}" -gt 0 ]; then
+            _warn "检测到旧的 Reality / H3 配置：本版本只维护 Argo 隧道，继续部署会移除这两个节点。"
+            _ask_yes "  继续? (y/N): " n || { _info "已取消。"; return 0; }
+        fi
+    fi
+
+    _install_dependencies || return 1
+    _install_xray_core auto || return 1
+    _install_cloudflared || return 1
+
+    _argo_auto_setup || return 1
+
+    _info "正在写入部署元数据..."
+    local uuid="" tmp
+    [ -s "$META_FILE" ] && uuid=$(jq -r '.uuid // ""' "$META_FILE" 2>/dev/null)
+    [ -n "$uuid" ] || uuid=$(_gen_uuid)
+
+    tmp=$(mktemp "${META_FILE}.tmp.XXXXXX") || return 1
+    if ! jq -n \
+        --arg uuid "$uuid" \
+        --argjson port "$ARGO_PORT" \
+        --arg path "${uuid}-argo" \
+        --arg domain "$ARGO_DOMAIN" \
+        --arg protocol "$ARGO_PROTOCOL" \
+        --arg token "$ARGO_TOKEN" \
+        --arg tid "$ARGO_TUNNEL_ID" \
+        --arg zid "$ARGO_ZONE_ID" \
+        --arg ip "$(_server_ip)" \
+        --arg created_at "$(date '+%Y-%m-%d %H:%M:%S')" \
+        '{
+            uuid: $uuid,
+            argo_port: $port,
+            argo_path: $path,
+            argo_domain: $domain,
+            argo_protocol: $protocol,
+            argo_token: $token,
+            argo_tunnel_id: $tid,
+            argo_zone_id: $zid,
+            server_ip: $ip,
+            created_at: $created_at
+        }' > "$tmp"; then
+        rm -f "$tmp"
+        _error "写入 meta.json 失败。"
+        return 1
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$META_FILE" || { rm -f "$tmp"; return 1; }
+
+    _info "正在生成 config.json..."
+    _write_config || return 1
+    _check_config || { _error "配置未通过校验，部署已中止。"; return 1; }
+
+    _create_service_files
+    _secure_permissions
+
+    _info "正在启动 Xray 服务..."
+    if ! _manage_service restart; then
+        _error "Xray 启动失败，请查看日志: ${LOG_FILE}"
+        return 1
+    fi
+    _success "Xray 服务已启动。"
+
+    if ! _setup_argo "$ARGO_TOKEN" "$ARGO_PROTOCOL"; then
+        _error "Argo 隧道启动失败，请检查: ${ARGO_LOG_FILE}"
+        return 1
+    fi
+    _success "Argo 隧道已启动。"
+
+    echo "" >&2
+    echo -e "${GREEN}──────────── 部署完成 ────────────${NC}" >&2
+    echo -e "  隧道域名 : ${ARGO_DOMAIN}" >&2
+    echo -e "  隧道协议 : ${ARGO_PROTOCOL}" >&2
+    echo -e "  本地端口 : 127.0.0.1:${ARGO_PORT}" >&2
+    echo -e "  服务模式 : ${INIT_SYSTEM}" >&2
+
+    _show_links
+    return 0
+}
+
+
+_show_status() {
+    local ver="未安装"
+    [ -x "$XRAY_BIN" ] && ver=$("$XRAY_BIN" version 2>/dev/null | head -n1)
+
+    echo "" >&2
+    echo -e "${CYAN}  ───── 运行状态 ─────${NC}" >&2
+    echo -e "  系统环境 : $(uname -s) $(uname -m)  |  服务模式: ${INIT_SYSTEM}" >&2
+    echo -e "  脚本版本 : ${GREEN}$(_version_full)${NC}" >&2
+    echo -e "  核心版本 : ${ver}" >&2
+
+    if _service_is_running; then
+        echo -e "  Xray     : ${GREEN}● 运行中${NC}" >&2
+    else
+        echo -e "  Xray     : ${RED}○ 已停止${NC}" >&2
+    fi
+    if [ -x "$CLOUDFLARED_BIN" ]; then
+        if _argo_is_running; then
+            echo -e "  Argo     : ${GREEN}● 运行中${NC}" >&2
+        else
+            echo -e "  Argo     : ${YELLOW}○ 已安装 (未运行)${NC}" >&2
+        fi
+    else
+        echo -e "  Argo     : ${RED}○ 未安装${NC}" >&2
+    fi
+
+    if [ -s "$META_FILE" ]; then
+        local st
+        st=$(_argo_transport 2>/dev/null | cut -d$'\x1f' -f1)
+        case "$st" in
+            quic)     echo -e "  Argo 传输: ${GREEN}QUIC (UDP)${NC}" >&2 ;;
+            http2)    echo -e "  Argo 传输: ${YELLOW}HTTP/2 (TCP)${NC}" >&2 ;;
+            fallback) echo -e "  Argo 传输: ${RED}QUIC 已回退 HTTP/2${NC}" >&2 ;;
+            *)        echo -e "  Argo 传输: ${YELLOW}未知${NC}" >&2 ;;
+        esac
+        echo -e "  隧道     : $(jq -r 'if (.argo_port // 0) > 0 then ((.argo_domain // "-") + "  (" + (.argo_protocol // "http2") + " / 127.0.0.1:" + (.argo_port | tostring) + ")") else "未配置" end' "$META_FILE" 2>/dev/null)" >&2
+        echo -e "  部署时间 : $(jq -r '.created_at // "-"' "$META_FILE" 2>/dev/null)" >&2
+    else
+        echo -e "  隧道     : ${YELLOW}尚未部署${NC}" >&2
+    fi
+    echo "" >&2
+}
+
+
+# 由 meta.json 重建 config.json 并重启：端口 / 密钥 / 节点链接都不变
+# 用于「改了脚本里的配置模板」这类修复（例如 Argo inbound 的 sockopt），不必重新部署
+_rebuild_config() {
+    _check_root
+    _detect_init_system
+
+    if [ ! -s "$META_FILE" ]; then
+        _error "尚未部署，没有可重建的配置。"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        _error "缺少 jq，无法由 meta.json 重建配置。"
+        return 1
+    fi
+
+    # 老版本可能留着 Reality / H3，重建后这两个节点会消失，先问一句
+    local legacy
+    legacy=$(jq -r '[(.reality_port // 0), (.h3_port // 0)] | map(select(. > 0)) | length' "$META_FILE" 2>/dev/null)
+    if [ "${legacy:-0}" -gt 0 ]; then
+        _warn "meta.json 里还有旧的 Reality / H3 配置，重建后只剩 Argo 节点。"
+        _ask_yes "  继续? (y/N): " n || { _info "已取消。"; return 0; }
+    fi
+
+    _info "正在由 meta.json 重建 config.json..."
+    local bak=""
+    if [ -s "$CONFIG_FILE" ]; then
+        bak="${CONFIG_FILE}.bak.$$"
+        cp -f "$CONFIG_FILE" "$bak" 2>/dev/null || bak=""
+    fi
+
+    if ! _write_config; then
+        [ -n "$bak" ] && mv -f "$bak" "$CONFIG_FILE"
+        _error "重建失败，已保留原配置。"
+        return 1
+    fi
+    if ! _check_config; then
+        if [ -n "$bak" ]; then
+            mv -f "$bak" "$CONFIG_FILE"
+            _warn "新配置未通过校验，已恢复原配置。"
+        else
+            _error "新配置未通过校验。"
+        fi
+        return 1
+    fi
+    [ -n "$bak" ] && rm -f "$bak"
+
+    if _service_is_running; then
+        _info "正在重启 Xray 服务..."
+        if ! _manage_service restart; then
+            _error "重启失败，请查看日志: ${LOG_FILE}"
+            return 1
+        fi
+        _success "配置已重建并重启，端口与节点链接保持不变。"
+    else
+        _info "服务当前未运行，配置已更新，下次启动生效。"
+    fi
+    return 0
+}
+
 
 _main_menu() {
     while true; do
-        clear 2>/dev/null || true
-        echo -e "${CYAN}"
-        echo '  __  __ ____             ____       '
-        echo '  \ \/ // __ \____ ___  _/ __ \____  '
-        echo '   \  // /_/ / __ `/ / / / / / / __ \ '
-        echo '   / // _, _/ /_/ / /_/ / /_/ / /_/ / '
-        echo '  /_//_/ |_|\__,_/\__, /\____/\____/  '
-        echo '                 /____/   Xray-go    '
-        echo -e "${NC}"
-        echo -e "${CYAN}  ╔══════════════════════════════════════════╗"
-        echo -e "  ║     Xray-go 一键部署管理脚本 V${SCRIPT_VERSION}        ║"
-        echo -e "  ╚══════════════════════════════════════════╝${NC}"
         echo "" >&2
-
+        echo -e "${CYAN}  ══════════════════════════════════════════════${NC}" >&2
+        echo -e "${CYAN}    Xray-go · Argo 隧道管理脚本    $(_version_tag)${NC}" >&2
+        echo -e "${CYAN}  ══════════════════════════════════════════════${NC}" >&2
         _show_status
-
-        echo -e "  ${CYAN}【部署】${NC}" >&2
-        echo -e "    ${GREEN}[1]${NC} 部署 Reality Vision (端口可选)" >&2
-        echo -e "    ${GREEN}[2]${NC} 部署 H3 直连 (端口可选)" >&2
-        echo -e "    ${GREEN}[3]${NC} Argo 自动搭建 (CF 邮箱 + API Key)" >&2
-        echo "" >&2
-        echo -e "  ${CYAN}【节点】${NC}" >&2
-        echo -e "    ${RED}[4]${NC} 删除节点 (Reality / H3 / Argo)" >&2
-        echo "" >&2
-        echo -e "  ${CYAN}【管理】${NC}" >&2
-        echo -e "    ${GREEN}[5]${NC} 查看节点链接" >&2
-        echo -e "    ${GREEN}[6]${NC} 服务控制" >&2
-        echo -e "    ${GREEN}[7]${NC} 查看实时日志" >&2
-        echo -e "    ${GREEN}[8]${NC} 查看 Argo 日志" >&2
-        echo -e "    ${GREEN}[9]${NC} 诊断 (配置/端口/防火墙/日志)" >&2
-        echo "" >&2
-        echo -e "  ${CYAN}【维护】${NC}" >&2
-        echo -e "    ${GREEN}[10]${NC} 更新 Xray 核心" >&2
-        echo -e "    ${GREEN}[11]${NC} 更新脚本" >&2
-        echo -e "    ${GREEN}[12]${NC} 卸载部署 (云端隧道 + DNS + 本地文件)" >&2
-        echo -e "    ${GREEN}[13]${NC} 重建配置 (由 meta 重新生成并重启，端口/链接不变)" >&2
+        echo -e "${CYAN}  ───── 菜单 ─────${NC}" >&2
+        echo -e "    ${GREEN}[1]${NC} 部署 / 重新部署 Argo 隧道 (CF 邮箱 + API Key)" >&2
+        echo -e "    ${GREEN}[2]${NC} 查看节点链接" >&2
+        echo -e "    ${GREEN}[3]${NC} 删除 Argo 节点 (云端隧道 + DNS)" >&2
+        echo -e "    ${GREEN}[4]${NC} 服务控制" >&2
+        echo -e "    ${GREEN}[5]${NC} Xray 日志" >&2
+        echo -e "    ${GREEN}[6]${NC} Argo 日志" >&2
+        echo -e "    ${GREEN}[7]${NC} 诊断 (监听 / 传输 / 日志 / 结论)" >&2
+        echo -e "    ${GREEN}[8]${NC} 重建配置 (改模板后免重装)" >&2
+        echo -e "    ${GREEN}[9]${NC} 更新 Xray 核心" >&2
+        echo -e "    ${GREEN}[10]${NC} 更新脚本" >&2
+        echo -e "    ${RED}[11]${NC} 卸载部署 (云端隧道 + DNS + 本地文件)" >&2
         echo "" >&2
         echo -e "  ───────────────────────────────────────────" >&2
         echo -e "    ${YELLOW}[0]${NC} 退出" >&2
         echo "" >&2
 
         local choice=""
-        read -r -p "  请输入选项 [0-13]: " choice || return 0
+        read -r -p "  请输入选项 [0-11]: " choice || return 0
         case "$choice" in
-            1) _deploy_single_proto reality ;;
-            2) _deploy_single_proto h3 ;;
-            3) _add_argo_only ;;
-            4) _delete_node_menu ;;
-            5) _show_links ;;
-            6) _service_menu ;;
-            7) _view_log ;;
-            8) _view_argo_log ;;
-            9) _check_config; echo "" >&2; _diag ;;
-            10) _update_core ;;
-            11) _update_script && exit 0 ;;
-            12) _uninstall_deploy
+            1) _deploy_argo ;;
+            2) _show_links ;;
+            3) _argo_delete_node ;;
+            4) _service_menu ;;
+            5) _view_log ;;
+            6) _view_argo_log ;;
+            7) _check_config; echo "" >&2; _diag ;;
+            8) _rebuild_config ;;
+            9) _update_core ;;
+            10) _update_script && exit 0 ;;
+            11) _uninstall_deploy
                 [ "${XG_UNINSTALLED:-0}" = "1" ] && exit 0 ;;
-            13) _rebuild_config ;;
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
@@ -3005,58 +1972,50 @@ _main_menu() {
     done
 }
 
-# ==============================================================================
-#  入口
-# ==============================================================================
 
 _print_help() {
     cat >&2 <<EOF
-Xray-go 管理脚本 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
+Xray-go · Argo 隧道版 V${SCRIPT_VERSION}  (构建 ${SCRIPT_BUILD})
 
 用法: $(basename "$0") [快捷指令 | 命令]
 
   快捷指令：
     1              进入管理菜单（推荐）
-    2              一键部署 Reality + H3
+    2              部署 / 重新部署 Argo 隧道
     3              查看节点链接
     4              查看运行状态
     5              卸载部署
     0              退出
 
-  注：以上是命令行快捷指令。进入菜单后是另一套编号：
-    [1] 部署 Reality   [2] 部署 H3   [3] Argo 自动搭建   [4] 删除节点
+  注：以上是命令行快捷指令，进入菜单后是另一套编号（见下方「菜单」）。
 
   完整命令：
     menu              进入管理菜单
-    deploy            同时部署 Reality + H3（随机端口）
-    reality           只部署 / 重部署 Reality（端口可选）
-    h3                只部署 / 重部署 H3（端口可选）
-    custom            自定义部署（一次选多个协议）
-    argo              Argo 自动搭建（CF 邮箱 + Global API Key；无部署时创建仅 Argo 节点）
-    del-node          删除节点（Reality / H3 / Argo 任选）
-    del-argo          直接删除 Argo 节点（含云端隧道 + DNS 解析）
+    deploy | argo     部署 / 重新部署 Argo 隧道（CF 邮箱 + Global API Key）
+    del-argo          删除 Argo 节点（含云端隧道 + DNS 解析）
     links             查看节点链接与 Base64 订阅
     status            查看运行状态
     start|stop|restart 控制 Xray 服务
-    log               查看实时日志
-    rebuild           由 meta.json 重建配置并重启（端口/链接不变，改配置后免重装）
+    log               查看 Xray 实时日志
+    argo-log          查看 Argo 实时日志
+    rebuild           由 meta.json 重建配置并重启（端口/链接不变）
     check             校验配置文件
-    diag              连通性自检（端口监听 / Argo 传输 UDP 还是 TCP / 防火墙 / 证书 / 日志 / 结论）
+    diag              连通性自检（本地监听 / Argo 走 UDP 还是 TCP / 日志 / 结论）
     update-core       更新 Xray 核心
     update-script     更新本脚本（同版本自动跳过，加 force 强制覆盖）
     -v | --version    查看当前脚本版本号
     uninstall         卸载部署（含云端隧道 + DNS + 本地文件）
 
-兼容旧版参数写法（示例）:
-  $(basename "$0") reality"n" h3"y" argo protocol"http2" port"8001" domain"" token""
+  菜单：
+    [1] 部署   [2] 链接   [3] 删节点   [4] 服务   [5] Xray 日志   [6] Argo 日志
+    [7] 诊断   [8] 重建配置   [9] 更新核心   [10] 更新脚本   [11] 卸载
 
-环境变量（一键部署时可选）:
-  ARGO_TOKEN / ARGO_DOMAIN / ARGO_PROTOCOL / ARGO_PORT
-  CF_EMAIL / CF_API_KEY   （提供后 Argo 走自动搭建，无需手动建隧道）
-  REALITY_SNI             （Reality 伪装目标，默认 www.apple.com）
-  H3_SNI                  （H3 自签证书域名，默认 bing.com）
+环境变量（部署时可选，免去交互）:
+  ARGO_DOMAIN / ARGO_PROTOCOL(http2|quic) / ARGO_PORT
+  CF_EMAIL / CF_API_KEY
 EOF
 }
+
 
 main() {
     local cmd="${1:-menu}"
@@ -3083,7 +2042,7 @@ main() {
             ;;
         2)
             _install_dependencies || exit 1
-            _one_click_deploy
+            _deploy_argo
             ;;
         3)
             _install_dependencies >/dev/null 2>&1
@@ -3101,29 +2060,11 @@ main() {
             exit 0
             ;;
         # ---- 完整命令 ----
-        deploy | install | onekey)
+        deploy | install | onekey | argo | argo-setup)
             _install_dependencies || exit 1
-            _one_click_deploy
+            _deploy_argo
             ;;
-        reality | reality-only)
-            _install_dependencies || exit 1
-            _deploy_single_proto reality
-            ;;
-        h3 | h3-only)
-            _install_dependencies || exit 1
-            _deploy_single_proto h3
-            ;;
-        del-node | delete-node | rm-node)
-            _delete_node_menu
-            ;;
-        custom)
-            _install_dependencies || exit 1
-            _custom_deploy
-            ;;
-        argo | add-argo | argo-setup)
-            _add_argo_only
-            ;;
-        del-argo | rm-argo | delete-argo)
+        del-argo | rm-argo | delete-argo | del-node)
             _argo_delete_node
             ;;
         links | show)
@@ -3170,11 +2111,16 @@ main() {
             _install_dependencies || _warn "依赖安装未完全成功，部分功能可能不可用。"
             _main_menu
             ;;
-        help | -h | --help)
-            _print_help
+        # 已移除的功能：给个明确说法，而不是 "未知命令"
+        reality | h3 | custom | reality-only | h3-only)
+            _error "V2.0 起只保留 Argo 隧道方案，Reality / H3 直连已移除。"
+            _info "部署 Argo：xg deploy（或菜单 [1]）"
+            return 1
             ;;
         *)
-            _legacy_deploy "$@"
+            _error "未知命令: ${cmd}"
+            _print_help
+            return 1
             ;;
     esac
 }

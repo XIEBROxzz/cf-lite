@@ -5,7 +5,7 @@
 #
 #  用法：
 #    bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
-#         -> 安装管理命令 xg，显示 1-5 数字菜单，输入数字直接执行
+#         -> 安装管理命令 xg，装完直接进入管理菜单
 #    bash <(curl -Ls .../install.sh) 2
 #         -> 安装后直接一键部署（全自动，无需交互）
 #    bash <(curl -Ls .../install.sh) 1
