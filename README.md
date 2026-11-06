@@ -22,23 +22,25 @@
 
 ## 🗂️ 三套方案：CF-A / CF-B / CF-C
 
-同一个仓库里放着三套**互相独立**的方案，按需装其中一套即可（也可以并存，互不干扰）：
+**CF-A**
 
-| 代号 | 脚本 | 一键命令 | 装出来的命令 | 定位 |
-| :--- | :--- | :--- | :--- | :--- |
-| **CF-A** | `xray_cf_lite.sh` | `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_cf_lite.sh)` | `x` | Xray + VLESS-WS + **CF Origin 证书**，域名 443 直连橙云回源，**不需要 cloudflared** |
-| **CF-B** | `singbox-lite_tunnel.sh` | `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/singbox-lite_tunnel.sh)` | `sb` | **sing-box** + cloudflared Argo 隧道（临时 / 固定），VLESS-WS、Trojan-WS 多节点并存 |
-| **CF-C** | `xray-go.sh` | `bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)` | `xg` | **Xray** + cloudflared Argo，CF 邮箱 + API Key 全自动，出 H2/H3 两条链接，零公网端口 |
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/xray_cf_lite.sh)
+```
 
-一句话区分：
+**CF-B**
 
-- **CF-A**：有域名、有 CF Origin 证书，想让节点直接落在 Cloudflare 上（WS + TLS 回源）。菜单 1-8：装节点 / 删节点 / 优选订阅 / 改 UUID·端口·路径 / 切换直连·NAT。
-- **CF-B**：想要 sing-box 内核，或者一条脚本里同时跑多个 Argo 节点（VLESS-WS + Trojan-WS）。
-- **CF-C**：只要 Argo、只要快——邮箱 + API Key 一把梭，隧道、ingress、DNS 全自动，装完就是两条现成链接。**本页讲的就是它。**
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/singbox-lite_tunnel.sh)
+```
 
-> **能不能装在同一台机器上？**
-> CF-B 用 `sing-box` 服务 + `/usr/local/etc/sing-box`，和另外两套完全不冲突，可以共存。
-> 但 **CF-A 和 CF-C 都会注册名为 `xray` 的服务**（CF-A 走官方 `xray.service` + `/usr/local/etc/xray`，CF-C 用 `/etc/xray` + 自建 `xray.service`），**同一台机器只能装其中一个**，否则会互相覆盖配置、抢同一个服务名。
+**CF-C**
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main/install.sh)
+```
+
+> CF-A 与 CF-C 都占用 `xray` 服务名，同一台机器只能装其中一个。
 
 ---
 
