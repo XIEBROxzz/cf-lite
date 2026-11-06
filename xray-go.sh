@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 版本号：更新脚本后对比此值即可确认是否更新成功（xg -v / 菜单标题 / 状态页均显示）
-export SCRIPT_VERSION="2.14"
+export SCRIPT_VERSION="2.15"
 export SCRIPT_BUILD="2026-11-06"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/cf-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/xray-go.sh"
@@ -106,7 +106,9 @@ _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
     if command -v apk >/dev/null 2>&1; then
-        apk add --no-cache $pkgs >/dev/null 2>&1
+        # --no-cache 要先拉远程索引，索引慢/失败时整条命令就废了；
+        # 退回普通模式（用本地缓存的索引），实测能救回不少装不上的场景
+        apk add --no-cache $pkgs >/dev/null 2>&1 || apk add $pkgs >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
             apt-get update -qq >/dev/null 2>&1
@@ -121,6 +123,19 @@ _pkg_install() {
         yum install -y $pkgs >/dev/null 2>&1
     else
         return 1
+    fi
+}
+
+# cron 的包名随发行版不同：Alpine=dcron / Debian 系=cron / RHEL 系=cronie
+_cron_pkg_name() {
+    if command -v apk >/dev/null 2>&1; then
+        echo "dcron"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "cron"
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        echo "cronie"
+    else
+        echo ""
     fi
 }
 
@@ -141,6 +156,19 @@ _install_dependencies() {
     _pkg_install $core_pkgs
     _pkg_install wget >/dev/null 2>&1 || true
     _pkg_install iptables >/dev/null 2>&1 || true
+
+    # cron 只用于 Argo 保活巡检，装不上不影响主功能（会自动降级为守护服务），
+    # 所以这里不参与下面的「关键依赖失败」判定
+    if ! command -v crontab >/dev/null 2>&1; then
+        local cron_pkg
+        cron_pkg=$(_cron_pkg_name)
+        if [ -n "$cron_pkg" ]; then
+            _info "正在安装 cron（用于 Argo 保活巡检）..."
+            _pkg_install "$cron_pkg" >/dev/null 2>&1 || true
+            command -v crontab >/dev/null 2>&1 \
+                || _warn "cron 安装失败，保活将改用守护服务（xg keepalive-on 30）"
+        fi
+    fi
 
     local missing="" cmd
     for cmd in bash curl jq openssl unzip; do

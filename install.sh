@@ -41,7 +41,8 @@ _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
     if command -v apk >/dev/null 2>&1; then
-        apk add --no-cache $pkgs >/dev/null 2>&1
+        # --no-cache 依赖远程索引，索引拉不到时退回普通模式
+        apk add --no-cache $pkgs >/dev/null 2>&1 || apk add $pkgs >/dev/null 2>&1
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq >/dev/null 2>&1
         DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
@@ -80,6 +81,20 @@ _info "正在检查基础依赖 (curl bash)..."
 for cmd in curl bash; do
     command -v "$cmd" >/dev/null 2>&1 || _pkg_install "$cmd"
 done
+
+# cron 用于后续 Argo 保活巡检；装不上不阻塞安装（xg 会自动降级为守护服务）
+if ! command -v crontab >/dev/null 2>&1; then
+    _info "正在安装 cron（用于 Argo 保活巡检）..."
+    if command -v apk >/dev/null 2>&1; then
+        _pkg_install dcron >/dev/null 2>&1 || true
+    elif command -v apt-get >/dev/null 2>&1; then
+        _pkg_install cron >/dev/null 2>&1 || true
+    else
+        _pkg_install cronie >/dev/null 2>&1 || true
+    fi
+    command -v crontab >/dev/null 2>&1 \
+        || _warn "cron 未装上，保活将使用守护服务（不影响使用）"
+fi
 if ! command -v curl >/dev/null 2>&1; then
     _error "缺少 curl，且自动安装失败，请手动安装后重试。"
     exit 1
